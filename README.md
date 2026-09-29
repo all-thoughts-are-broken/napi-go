@@ -306,4 +306,5 @@ and that the functional and stress suites still pass.
 ## License
 
 [MIT](LICENSE). The vendored Node.js headers and `windows/node.lib` are
-redistributed unmodified under the Node.js project's MIT license.
+redistributed unmodified under the Node.js project's MIT license; see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

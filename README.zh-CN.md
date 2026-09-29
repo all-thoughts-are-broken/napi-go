@@ -282,4 +282,4 @@ go test -race ./napi/...
 ## 许可证
 
 [MIT](LICENSE)。内置的 Node.js 头文件与 `windows/node.lib` 原样分发，遵循 Node.js
-项目的 MIT 许可证。
+项目的 MIT 许可证；详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
