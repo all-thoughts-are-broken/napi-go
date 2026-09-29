@@ -1,0 +1,181 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOFLAGS: -mod=readonly
+
+jobs:
+  # Static checks and the pure-Go race tests. Runs once: the results do not
+  # depend on the platform or the Node.js version.
+  lint:
+    name: Lint, vet, race
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            printf 'These files are not gofmt-clean:\n%s\n' "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Build all packages
+        run: go build ./...
+
+      - name: Race detector (cgo handle registry)
+        env:
+          CGO_ENABLED: "1"
+        run: go test -race ./napi/...
+
+  # Compatibility matrix: every supported platform crossed with every supported
+  # Node.js release. The functional suite exercises the whole exported API
+  # surface, so a green run here means the addon really does load and behave on
+  # that Node.js version.
+  test-unix:
+    name: ${{ matrix.os }} · Node ${{ matrix.node }}
+    needs: lint
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: ["18", "20", "22", "24"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Toolchain
+        run: |
+          go version
+          node --version
+          cc --version | head -n 1
+
+      - name: Build addons
+        run: |
+          go build -buildmode=c-shared -o example/goaddon.node ./example
+          go build -buildmode=c-shared -o stress/stress.node ./stress
+
+      - name: Functional tests
+        run: node --expose-gc example/test.mjs
+
+  test-windows:
+    name: windows-latest · Node ${{ matrix.node }}
+    needs: lint
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["18", "20", "22", "24"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # Node-API is a plain C ABI, so MinGW-w64 gcc is enough — no MSVC and no
+      # node-gyp. `path-type: inherit` keeps the Go and Node installations on
+      # PATH inside the MSYS2 shell.
+      - uses: msys2/setup-msys2@v2
+        with:
+          update: false
+          path-type: inherit
+          install: mingw-w64-ucrt-x86_64-gcc
+
+      - name: Toolchain
+        shell: msys2 {0}
+        run: |
+          go version
+          node --version
+          gcc --version | head -n 1
+
+      - name: Build addons
+        shell: msys2 {0}
+        run: |
+          go build -buildmode=c-shared -o example/goaddon.node ./example
+          go build -buildmode=c-shared -o stress/stress.node ./stress
+
+      - name: Functional tests
+        shell: msys2 {0}
+        run: node --expose-gc example/test.mjs
+
+      - name: Upload addon on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: goaddon-windows-node${{ matrix.node }}
+          path: example/goaddon.node
+          if-no-files-found: ignore
+
+  # The heavy suites: 18 stress scenarios plus the adversarial probes. They are
+  # platform-independent behaviour tests, so one representative leg is enough.
+  deep:
+    name: Stress and probes (ubuntu · Node 22)
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Build addons
+        run: |
+          go build -buildmode=c-shared -o example/goaddon.node ./example
+          go build -buildmode=c-shared -o stress/stress.node ./stress
+          go build -buildmode=c-shared -o probe/probe.node ./probe
+
+      - name: Functional tests
+        run: node --expose-gc example/test.mjs
+
+      - name: Stress scenarios
+        run: node --expose-gc stress/run_all.mjs
+
+      # Both probe suites must report `bugs=0`. The remaining notes are
+      # documented engine behaviours, not binding defects.
+      - name: Adversarial probes (main suite)
+        run: node --expose-gc probe/run.mjs
+
+      - name: Adversarial probes (edge cases)
+        run: node --expose-gc probe/edge.mjs
