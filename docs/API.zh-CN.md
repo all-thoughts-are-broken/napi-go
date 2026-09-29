@@ -30,6 +30,17 @@
 | `CreateExternal(env, any, onFinalize)` | 包装任意 Go 值的不透明对象 |
 | `CreateError` / `CreateTypeError` / `CreateRangeError` | Error 对象（code/msg 为 Value） |
 
+三个 `Create*Error` 的 `code` 参数必须是字符串或 `nil`；`nil` 就是「没有错误码」
+的写法，传 `undefined` 会得到 `napi_string_expected`。这一点容易漏，因为该函数返回
+`(Value, error)`——忽略错误的话，reject 出去的就是一个裸字符串而不是 `Error`：
+
+```go
+undef, _ := napi.GetUndefined(env)        // 错：napi_string_expected
+ev, err := napi.CreateError(env, undef, msg)
+
+ev, err := napi.CreateError(env, nil, msg) // 对：不带错误码
+```
+
 ## 值：读取与判断
 
 | 函数 | 说明 |
@@ -124,6 +135,13 @@ tsfn.Acquire() / Release(mode) / Ref(env) / Unref(env)
   模式让它自然收尾。
 - 闭包持有 `napi.Value` 跨回调是非法的；需要保留 JS 值时在闭包里用
   `napi.CreateReference`。
+- **闭包里调用 JS、而那段 JS 抛异常时**，`CallFunction` 返回
+  `napi_pending_exception`，异常留在环境上。Node 22.22.2 实测：这**不会**污染同一次
+  派发的后续调用——`create_object`、`create_string_utf8`、`get_undefined` 仍全部返回
+  `napi_ok`，`GetAndClearLastException` 可以清掉该状态。异常最终怎么处理由引擎决定：
+  默认打一条 `DEP0168` 然后丢弃；开了
+  `--force-node-api-uncaught-exceptions-policy=true` 则变成真正的 uncaught exception。
+  要主动决定是让它浮出来还是清掉，别假设抛了就静默消失了。
 
 ## Buffer / ArrayBuffer / TypedArray / DataView
 

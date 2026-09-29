@@ -32,6 +32,19 @@ Unless stated otherwise, every function must be called on the **JS thread**
 | `CreateExternal(env, any, onFinalize)` | opaque object wrapping an arbitrary Go value |
 | `CreateError` / `CreateTypeError` / `CreateRangeError` | Error objects (code and message are `Value`s) |
 
+The `code` argument of the three `Create*Error` functions must be a string or
+`nil`; `nil` is how "no error code" is spelled. The engine answers
+`napi_string_expected` for `undefined`. That is easy to miss because the call
+returns a `(Value, error)` pair — ignore the error and the promise you reject
+with carries a bare object or string instead of an `Error`:
+
+```go
+undef, _ := napi.GetUndefined(env)        // no: napi_string_expected
+ev, err := napi.CreateError(env, undef, msg)
+
+ev, err := napi.CreateError(env, nil, msg) // yes: no code
+```
+
 ## Values: reads and predicates
 
 | Function | Notes |
@@ -132,6 +145,15 @@ tsfn.Acquire() / Release(mode) / Ref(env) / Unref(env)
   or just use plain `Release` and let it wind down naturally.
 - A closure must not capture a `napi.Value` across callbacks. To keep a JS value
   inside the closure, use `napi.CreateReference`.
+- **When your closure calls into JS and that JS throws**, `CallFunction` reports
+  `napi_pending_exception` and the exception is left pending on the environment.
+  Measured on Node 22.22.2: this does not poison the rest of the dispatch —
+  `create_object`, `create_string_utf8` and `get_undefined` all still return
+  `napi_ok`, and `GetAndClearLastException` clears the state. What happens to
+  the exception is the engine's decision: by default it logs `DEP0168` and drops
+  it, and under `--force-node-api-uncaught-exceptions-policy=true` it becomes a
+  real uncaught exception. Decide deliberately whether to surface it or clear
+  it; do not assume a throw has silently vanished.
 
 ## Buffer / ArrayBuffer / TypedArray / DataView
 

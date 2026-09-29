@@ -7,7 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing yet.
+### Documented
+
+- `CreateError` / `CreateTypeError` / `CreateRangeError` take a `code` that
+  must be a string or `nil`. Passing `undefined` returns
+  `napi_string_expected` — easy to miss, because the call returns a
+  `(Value, error)` pair, and the value it hands back in that case cannot be
+  used as an `Error`. Found while building an addon that rejected a promise
+  with it: the rejection reached JavaScript as a bare string.
+- What a throwing JS callback does to a threadsafe-function dispatch. Measured
+  on Node 22.22.2: `CallFunction` reports `napi_pending_exception`, the
+  exception stays pending on the environment, and the rest of the dispatch
+  still works — `create_object`, `create_string_utf8` and `get_undefined` all
+  return `napi_ok` while it is pending, and `GetAndClearLastException` clears
+  it. The engine, not the binding, decides the outcome: by default it logs
+  `DEP0168` and drops the exception; under
+  `--force-node-api-uncaught-exceptions-policy=true` it becomes an uncaught
+  exception.
 
 ## [0.1.1] - 2026-09-29
 
