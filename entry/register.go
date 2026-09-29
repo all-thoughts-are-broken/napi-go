@@ -1,6 +1,11 @@
 package entry
 
 /*
+// entry_preamble.h includes <node_api.h>, so this package needs the same
+// vendored header path the napi package uses. Without it the package only
+// builds where the headers happen to be on the system include path.
+#cgo CFLAGS: -I${SRCDIR}/../include/node
+
 #include "entry_preamble.h"
 */
 import "C"

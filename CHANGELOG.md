@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [0.1.1] - 2026-09-29
+
+### Fixed
+
+- The `entry` package did not pass the vendored header directory to the C
+  compiler. `register.go` includes `entry_preamble.h`, which includes
+  `<node_api.h>`, but the package carried no `-I` directive for `include/node`,
+  so it only compiled where the headers happened to be reachable already — for
+  example through a local `CGO_CFLAGS` override. On a clean checkout anything
+  that compiles the package failed with
+  `fatal error: node_api.h: No such file or directory`, which is what broke CI.
+  `entry` now carries the same `#cgo CFLAGS` directive as `napi`, so the module
+  builds on a machine that has nothing configured beyond Go and a C compiler.
+
 ## [0.1.0] - 2026-09-29
 
 Initial release.
@@ -303,5 +317,6 @@ normally (probe control group Δ0). **Treat `DefineClass` as a one-time
 module-initialisation operation and keep it out of hot paths.** See the known
 limitations in `docs/DESIGN.md`.
 
-[Unreleased]: https://github.com/all-thoughts-are-broken/napi-go/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/all-thoughts-are-broken/napi-go/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/all-thoughts-are-broken/napi-go/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/all-thoughts-are-broken/napi-go/releases/tag/v0.1.0
