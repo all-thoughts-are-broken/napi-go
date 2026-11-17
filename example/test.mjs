@@ -579,6 +579,39 @@ check("worker-only load (the addon outlives the only environment that loaded it)
   }
 });
 
+check("DefineProperties (methods and accessors outlive the object they were defined on)", () => {
+  // A method read off an object, or an accessor taken from its property
+  // descriptor, is a function in its own right: JavaScript may keep it long
+  // after the object is gone. Its Go callback has to live exactly as long.
+  const r = runIsolated(`
+    const addon = require(process.argv[1]);
+    const tick = () => new Promise((r) => setImmediate(r));
+    (async () => {
+      let map = addon.wrapMap();
+      map.set("lang", "Go");
+      const get = map.get;
+      const size = Object.getOwnPropertyDescriptor(map, "size").get;
+      console.log("NAMES", JSON.stringify([get.name, size.name]));
+      const host = new WeakRef(map);
+      map = null;
+      // No deref() inside the loop: reading a WeakRef keeps its target alive
+      // until the current job ends, which would defeat the collection.
+      for (let i = 0; i < 8; i++) { gc(); await tick(); }
+      console.log("HOST_COLLECTED", host.deref() === undefined);
+      // Hand the allocator plenty of new callbacks: storage freed along with
+      // the host would now belong to one of these.
+      const others = [];
+      for (let i = 0; i < 256; i++) others.push(addon.goFuncDemo());
+      console.log("GET", get("lang"));
+      console.log("SIZE", size.call({}));
+    })();
+  `);
+  assert.strictEqual(r.status, 0, r.describe());
+  assert.match(r.stdout, /HOST_COLLECTED true/, r.describe());
+  assert.match(r.stdout, /GET Go\r?\n/, r.describe());
+  assert.match(r.stdout, /SIZE 1\r?\n/, r.describe());
+});
+
 // Let every promise settle, then report.
 Promise.allSettled(pending).then(() => {
   if (process.exitCode) {

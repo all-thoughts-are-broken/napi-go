@@ -66,7 +66,7 @@ ev, err := napi.CreateError(env, nil, msg) // yes: no code
 | `SetNamedProperty/GetNamedProperty/HasNamedProperty` | by UTF-8 name (convenience) |
 | `SetElement/GetElement/HasElement/DeleteElement` | by index |
 | `GetPrototype` / `GetPropertyNames` / `GetAllPropertyNames` | prototype and key enumeration (configurable mode/filter/conversion) |
-| `DefineProperties(env, object, []PropertyDescriptor)` | batch definition (methods, getters, setters, data). Each descriptor needs a `Name` or `NameValue`, otherwise `napi_invalid_arg` is returned — the engine dereferences a NULL name and crashes. |
+| `DefineProperties(env, object, []PropertyDescriptor)` | batch definition (methods, getters, setters, data). Each descriptor needs a `Name` or `NameValue`, otherwise `napi_invalid_arg` is returned — the engine dereferences a NULL name and crashes. Every method, getter and setter is a function that owns its Go callback, so it stays callable after `object` is collected (`const m = obj.m` is safe to keep). |
 | `ObjectFreeze` / `ObjectSeal` | freeze and seal |
 | `TypeTagObject` / `CheckObjectTypeTag` | 128-bit type tags (native type checking) |
 | `Wrap(env, obj, any, onFinalize)` / `Unwrap` / `RemoveWrap` | attach a Go value to a JS object (with a finalizer). The value and the finalizer share **one box**, so `RemoveWrap` leaves nothing behind, and the finalizer will not run after it. |

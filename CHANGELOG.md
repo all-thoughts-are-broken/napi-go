@@ -26,6 +26,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Go runtimes in one process". A shared path is still recommended — every copy
   is a separate runtime with separate state — but doing otherwise no longer
   crashes.
+- **A method or accessor defined with `DefineProperties` ran the wrong Go
+  callback once its object had been collected.** The callback boxes were tied
+  to the object the properties were defined on, but a method read off that
+  object (`const m = obj.m`) or an accessor taken from its property descriptor
+  is a function of its own, and JavaScript can keep it after the object is gone.
+  Collecting the object freed the boxes underneath those functions, and the next
+  call read recycled storage. Measured: the extracted method returned another
+  function's result, with no error, and the extracted getter failed with
+  "getter data missing".
+
+  Every such function now owns its box, exactly as a `CreateFunction` function
+  does. The binding creates the function itself and defines a method as a data
+  property holding it (what the engine does with a method anyway) and an
+  accessor through `Reflect.defineProperty`. What ends up on the object is
+  unchanged — same keys, same order, same attributes, same statuses on failure —
+  and the debug box counter now shows one box per function instead of one per
+  descriptor plus one per call. `DefineClass` is unaffected: its boxes are tied
+  to the class, which the engine never collects.
 
 ### Documented
 

@@ -119,6 +119,15 @@ func GetAllPropertyNames(env Env, object Value, keyMode KeyCollectionMode, keyFi
 
 // propsResult holds the C descriptor array produced by buildProps plus the
 // callback boxes whose lifetime must now outlive the define call.
+//
+// It serves DefineClass only. A class has to hand its callbacks to the engine
+// as C function pointers — prototype members are built from templates, not
+// from function objects the binding could own — so the functions the engine
+// makes from them are out of reach and their boxes are tied to the class
+// constructor instead. That is sound for exactly one reason: the engine never
+// collects a class (see DefineClass), so the constructor outlives every
+// function that carries one of these boxes. DefineProperties has no such
+// guarantee and gives every function its own box instead.
 type propsResult struct {
 	cProps *C.napi_property_descriptor
 	boxes  []unsafe.Pointer
@@ -145,7 +154,7 @@ func napiGoPropsFinalizeCallback(cEnv C.napi_env, cData, cHint unsafe.Pointer) {
 	}
 }
 
-// buildProps converts Go descriptors into a C array of
+// buildProps converts the Go descriptors of a class into a C array of
 // napi_property_descriptor. The caller MUST either
 // result.attachFinalizer(env, object) or result.release() after the define
 // call: release frees everything (for failed defines), attachFinalizer
@@ -163,15 +172,8 @@ func buildProps(props []PropertyDescriptor) (*propsResult, error) {
 
 	for i, p := range props {
 		if p.Name == "" && p.NameValue == nil {
-			// A descriptor with neither utf8name nor name makes the engine
-			// dereference the NULL name slot (v8impl::V8NameFromProperty
-			// Descriptor calls IsName() on a null Local) and take the whole
-			// process down. Reject it here instead.
 			r.release()
-			return nil, &StatusError{
-				Code:    StatusInvalidArg,
-				Message: "property descriptor has no name: set Name or NameValue",
-			}
+			return nil, errNamelessProperty()
 		}
 
 		var utf8name *C.char
@@ -262,25 +264,253 @@ func (r *propsResult) freeCStrs() {
 	r.cstrs = nil
 }
 
-// DefineProperties defines a batch of properties on an object.
+// DefineProperties defines a batch of properties on an object, in order.
+//
+// Every Method, Getter and Setter becomes a JS function that owns its Go
+// callback: the callback is released when that function is collected, not when
+// object is. The two lifetimes are different. A method read off the object
+// (const m = obj.m) and an accessor taken from its property descriptor are
+// ordinary functions that JavaScript can keep and call long after object is
+// gone; tying their callback data to object freed it underneath them, and the
+// next call ran whichever Go callback had been given the recycled storage —
+// measured as a method returning another function's result, with no error.
+//
+// To own the functions, the binding has to create them, which changes how a
+// descriptor reaches the engine but not what it defines:
+//
+//   - a Method is created as a function and defined as a data property holding
+//     it, which is what napi_define_properties does with a method itself;
+//   - a Getter/Setter pair is created as functions and defined with
+//     Reflect.defineProperty, because napi_define_properties can only build an
+//     accessor from C callbacks whose functions it never hands back.
+//
+// Properties are defined one after another, as the engine does, so the object
+// ends up with the same keys in the same order, and a failure leaves the
+// earlier ones in place.
 func DefineProperties(env Env, object Value, props []PropertyDescriptor) error {
-	built, err := buildProps(props)
+	for _, p := range props {
+		if p.Name == "" && p.NameValue == nil {
+			return errNamelessProperty()
+		}
+	}
+
+	d := propertyDefiner{env: env, object: object}
+	for _, p := range props {
+		switch {
+		case p.Getter != nil || p.Setter != nil:
+			// An accessor cannot join the run of data properties, so that run
+			// is defined first to keep the keys in the order they were given.
+			if err := d.flush(); err != nil {
+				return err
+			}
+			if err := d.defineAccessor(p); err != nil {
+				return err
+			}
+		case p.Method != nil:
+			if err := d.flush(); err != nil {
+				return err
+			}
+			if err := d.defineMethod(p); err != nil {
+				return err
+			}
+		default:
+			d.pending = append(d.pending, p)
+		}
+	}
+	return d.flush()
+}
+
+// errNamelessProperty rejects a descriptor with neither Name nor NameValue.
+// The engine dereferences the NULL name slot (v8impl::V8NameFromProperty
+// Descriptor calls IsName() on a null Local) and takes the whole process down.
+func errNamelessProperty() error {
+	return &StatusError{
+		Code:    StatusInvalidArg,
+		Message: "property descriptor has no name: set Name or NameValue",
+	}
+}
+
+// propertyDefiner carries the state of one DefineProperties call.
+type propertyDefiner struct {
+	env    Env
+	object Value
+
+	// pending is the run of data properties not yet handed to the engine.
+	pending []PropertyDescriptor
+	// checked records that the engine has accepted object as a target.
+	checked bool
+
+	// Looked up once per call, on the first accessor.
+	target         Value // object as the engine sees it (after ToObject)
+	reflect        Value
+	defineProperty Value
+}
+
+// flush hands the pending run of data properties to napi_define_properties in
+// one call. A call with no properties still reaches the engine once: that is
+// its own verdict on the target (napi_object_expected for undefined, and so
+// on), which has to come before an accessor is defined and has to be reported
+// even when there is nothing to define.
+func (d *propertyDefiner) flush() error {
+	if len(d.pending) == 0 && d.checked {
+		return nil
+	}
+	err := defineDataProperties(d.env, d.object, d.pending)
+	d.pending = d.pending[:0]
 	if err != nil {
 		return err
 	}
+	d.checked = true
+	return nil
+}
 
-	st := C.napi_define_properties(C.napi_env(env), C.napi_value(object), C.size_t(len(props)), built.cProps)
-	if st != C.napi_ok {
-		built.release()
-		return errOf(env, Status(st))
+// defineDataProperties defines value-only descriptors. None of them carries a
+// callback, so nothing here has to outlive the call.
+func defineDataProperties(env Env, object Value, props []PropertyDescriptor) error {
+	var cProps *C.napi_property_descriptor
+	if len(props) > 0 {
+		cProps = C.go_props_alloc(C.size_t(len(props)))
+		if cProps == nil {
+			return &StatusError{Code: StatusGenericFailure, Message: "out of memory"}
+		}
+		defer C.go_props_free(cProps)
+
+		for i, p := range props {
+			var utf8name *C.char
+			var nameValue Value
+			if p.Name != "" {
+				// napi copies the name into the property; the C string only
+				// has to live until the define call returns.
+				utf8name = C.CString(p.Name)
+				defer C.free(unsafe.Pointer(utf8name))
+			} else {
+				nameValue = p.NameValue
+			}
+			C.go_props_set(
+				cProps, C.size_t(i),
+				utf8name, C.napi_value(nameValue),
+				nil, nil, nil,
+				C.napi_value(p.Value),
+				C.uint(p.Attributes),
+				nil,
+			)
+		}
 	}
-	// The C array itself can be freed right away; only the callback boxes
-	// need to outlive the call.
-	if built.cProps != nil {
-		C.go_props_free(built.cProps)
-		built.cProps = nil
+
+	st := C.napi_define_properties(C.napi_env(env), C.napi_value(object), C.size_t(len(props)), cProps)
+	return errOf(env, Status(st))
+}
+
+// defineMethod defines one method: a function the binding created, held by a
+// data property.
+//
+// It is defined on its own rather than with the run of data properties so that
+// a refusal can be reported as napi_define_properties reports it. The engine
+// answers napi_generic_failure when the object refuses a method and
+// napi_invalid_arg when it refuses a value; the method travels as a value here,
+// so the second is mapped back to the first. With a single value descriptor,
+// napi_invalid_arg has no other source.
+func (d *propertyDefiner) defineMethod(p PropertyDescriptor) error {
+	fn, err := newCallbackFunction(d.env, "", cbData{cb: p.Method}, C.napi_callback(C.napiGoExecuteCallback))
+	if err != nil {
+		return err
 	}
-	built.attachFinalizer(env, object)
+	err = defineDataProperties(d.env, d.object, []PropertyDescriptor{{
+		Name: p.Name, NameValue: p.NameValue, Value: fn, Attributes: p.Attributes,
+	}})
+	if se, ok := err.(*StatusError); ok && se.Code == StatusInvalidArg {
+		return &StatusError{Code: StatusGenericFailure, Message: "Unknown failure"}
+	}
+	return err
+}
+
+// defineAccessor defines one accessor property from functions the binding
+// created, through Reflect.defineProperty.
+//
+// It reports failure the way napi_define_properties does: a definition the
+// object refuses (frozen, or an existing non-configurable property) is
+// napi_invalid_arg, and one that throws leaves the exception pending.
+func (d *propertyDefiner) defineAccessor(p PropertyDescriptor) error {
+	env := d.env
+	if d.defineProperty == nil {
+		// napi_define_properties applies ToObject to its target; do the same,
+		// so that a primitive target behaves as it does for data properties.
+		target, err := CoerceToObject(env, d.object)
+		if err != nil {
+			return err
+		}
+		global, err := GetGlobal(env)
+		if err != nil {
+			return err
+		}
+		reflect, err := GetNamedProperty(env, global, "Reflect")
+		if err != nil {
+			return err
+		}
+		defineProperty, err := GetNamedProperty(env, reflect, "defineProperty")
+		if err != nil {
+			return err
+		}
+		d.target, d.reflect, d.defineProperty = target, reflect, defineProperty
+	}
+
+	key := p.NameValue
+	if p.Name != "" {
+		var err error
+		if key, err = CreateStringUtf8(env, p.Name); err != nil {
+			return err
+		}
+	}
+
+	desc, err := CreateObject(env)
+	if err != nil {
+		return err
+	}
+	if p.Getter != nil {
+		fn, err := newCallbackFunction(env, "", cbData{get: p.Getter}, C.napi_callback(C.napiGoGetterCallback))
+		if err != nil {
+			return err
+		}
+		if err := SetNamedProperty(env, desc, "get", fn); err != nil {
+			return err
+		}
+	}
+	if p.Setter != nil {
+		fn, err := newCallbackFunction(env, "", cbData{set: p.Setter}, C.napi_callback(C.napiGoSetterCallback))
+		if err != nil {
+			return err
+		}
+		if err := SetNamedProperty(env, desc, "set", fn); err != nil {
+			return err
+		}
+	}
+	for _, flag := range []struct {
+		name string
+		on   bool
+	}{
+		{"enumerable", p.Attributes&Enumerable != 0},
+		{"configurable", p.Attributes&Configurable != 0},
+	} {
+		v, err := GetBoolean(env, flag.on)
+		if err != nil {
+			return err
+		}
+		if err := SetNamedProperty(env, desc, flag.name, v); err != nil {
+			return err
+		}
+	}
+
+	defined, err := CallFunction(env, d.reflect, d.defineProperty, d.target, key, desc)
+	if err != nil {
+		return err
+	}
+	ok, err := GetValueBool(env, defined)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return &StatusError{Code: StatusInvalidArg, Message: "Invalid argument"}
+	}
 	return nil
 }
 

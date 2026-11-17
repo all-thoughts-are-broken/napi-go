@@ -62,7 +62,7 @@ ev, err := napi.CreateError(env, nil, msg) // 对：不带错误码
 | `SetNamedProperty/GetNamedProperty/HasNamedProperty` | 按 UTF-8 名（便捷） |
 | `SetElement/GetElement/HasElement/DeleteElement` | 按索引 |
 | `GetPrototype` / `GetPropertyNames` / `GetAllPropertyNames` | 原型与键枚举（可配 mode/filter/conversion） |
-| `DefineProperties(env, object, []PropertyDescriptor)` | 批量定义（方法/getter/setter/data）。每个描述符必须给 `Name` 或 `NameValue`，否则返回 `napi_invalid_arg`（引擎对 NULL name 是解引用崩溃） |
+| `DefineProperties(env, object, []PropertyDescriptor)` | 批量定义（方法/getter/setter/data）。每个描述符必须给 `Name` 或 `NameValue`，否则返回 `napi_invalid_arg`（引擎对 NULL name 是解引用崩溃）。每个方法、getter、setter 都是拥有自己 Go 回调的函数，`object` 被回收后依然可以调用（`const m = obj.m` 可以放心保留） |
 | `ObjectFreeze` / `ObjectSeal` | 冻结与密封 |
 | `TypeTagObject` / `CheckObjectTypeTag` | 128 位类型标签（native 类型校验） |
 | `Wrap(env, obj, any, onFinalize)` / `Unwrap` / `RemoveWrap` | Go 值挂到 JS 对象（带 finalizer）。值与 finalizer 共用**一个盒子**，所以 `RemoveWrap` 之后不会残留任何盒子；`RemoveWrap` 后 finalizer 不再触发 |

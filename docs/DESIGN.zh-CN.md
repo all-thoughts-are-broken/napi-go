@@ -46,9 +46,22 @@ JS 调用 f(x)
 - **盒子（box）**：C malloc 的一个指针槽，存 `cgo.Handle`。这绕开了 Go 的
   `unsafe.Pointer` 规则（uintptr→pointer 转换只发生在 C 里），让句柄可以合法
   存进 C 结构体的 `void* data`。
-- **自动清理**：`CreateFunction` 在函数对象上注册 `napi_add_finalizer`；
-  JS GC 回收函数时，finalizer 删除 cgo handle 并释放盒子。属性描述符的
-  盒子同理挂在宿主对象上（`napiGoPropsFinalizeCallback`）。
+- **自动清理：回调盒子属于它的函数**：`CreateFunction` 在函数对象上注册
+  `napi_add_finalizer`；JS GC 回收函数时，finalizer 删除 cgo handle 并释放盒子。
+  `DefineProperties` 对每个方法、getter、setter 遵循同一条规则：函数由绑定自己
+  创建（方法随后作为持有它的数据属性来定义，访问器通过 `Reflect.defineProperty`
+  定义），于是每个函数拥有自己的盒子。
+
+  这些盒子以前挂在**宿主对象**上，那是一个 use-after-free。从对象上读出的方法
+  （`const m = obj.m`）或从属性描述符里取出的访问器都是普通函数，可以比对象活得
+  久；对象一被回收，盒子就被释放，下一次调用执行的是恰好拿到这块被重用内存的
+  那个 Go 回调。实测：取出的方法返回了另一个函数的结果，全程没有任何报错。
+  任何对象的死亡都说明不了一个函数是否还能被调用——只有函数自己的死亡可以。
+
+  `DefineClass` 是唯一的例外，而且只因为"已知限制"里描述的引擎行为才成立：原型
+  成员由模板构建，绑定无法拥有那些函数，它们的盒子挂在类构造函数上
+  （`napiGoPropsFinalizeCallback`）。这之所以安全，是因为引擎永不回收类，构造函数
+  比它们都活得久。
 - **带用户的 finalizer 时只用一个盒子**：`Wrap` / `CreateExternal` /
   `AddFinalizer` / `SetInstanceData` 把「Go 值 + 用户 finalizer」一起装进
   `finalizePayload{data, fn}` 这个单一盒子，而不是分别占用 data 槽和 hint 槽。

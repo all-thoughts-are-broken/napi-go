@@ -50,10 +50,27 @@ JS calls f(x)
 - **The box.** A pointer slot allocated with C `malloc` holding a `cgo.Handle`.
   This sidesteps Go's `unsafe.Pointer` rules (the uintptr→pointer conversion
   happens in C), so the handle can legally live in a C struct's `void *data`.
-- **Automatic cleanup.** `CreateFunction` registers a `napi_add_finalizer` on the
-  function object; when JS collects it, the finalizer deletes the cgo handle and
-  frees the box. Property-descriptor boxes hang off the host object the same way
-  (`napiGoPropsFinalizeCallback`).
+- **Automatic cleanup: a callback box belongs to its function.** `CreateFunction`
+  registers a `napi_add_finalizer` on the function object; when JS collects it,
+  the finalizer deletes the cgo handle and frees the box. `DefineProperties`
+  follows the same rule for every method, getter and setter: the binding creates
+  the function itself (a method is then defined as a data property holding it,
+  an accessor through `Reflect.defineProperty`), so each one owns its box.
+
+  The boxes used to hang off the *host object* instead, and that was a
+  use-after-free. A method read off an object (`const m = obj.m`) or an accessor
+  taken from its property descriptor is an ordinary function that outlives the
+  object; once the object was collected its boxes were freed, and the next call
+  ran whichever Go callback had been handed the recycled storage. Measured: the
+  extracted method returned another function's result, with no error anywhere.
+  No object's death says anything about whether a function is still callable —
+  only the function's own does.
+
+  `DefineClass` is the one exception, and only because of the engine behaviour
+  described under "Known limitations": prototype members are built from
+  templates, so the binding cannot own those functions, and their boxes are tied
+  to the class constructor (`napiGoPropsFinalizeCallback`). That is sound because
+  the engine never collects a class, so the constructor outlives them all.
 - **One box even with a user finalizer.** `Wrap` / `CreateExternal` /
   `AddFinalizer` / `SetInstanceData` pack "Go value + user finalizer" into a
   single `finalizePayload` box rather than occupying the data slot and the hint
