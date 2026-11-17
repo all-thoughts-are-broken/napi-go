@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `AsStatus` sees through wrapped errors (`errors.As`). An error annotated with
+  `fmt.Errorf("...: %w", err)` used to lose its status.
+
 ### Fixed
 
 - **An addon held only by a Worker crashed the process when the Worker

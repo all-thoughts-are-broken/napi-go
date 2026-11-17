@@ -5,7 +5,10 @@ package napi
 */
 import "C"
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
 
 // Status is a napi_status error code.
 type Status uint32
@@ -88,9 +91,11 @@ func (e *StatusError) Error() string {
 	return fmt.Sprintf("node-api: %s: %s", e.Code, e.Message)
 }
 
-// AsStatus extracts the napi_status from err if it is a StatusError.
+// AsStatus extracts the napi_status from err if it is, or wraps, a
+// StatusError.
 func AsStatus(err error) (Status, bool) {
-	if se, ok := err.(*StatusError); ok {
+	var se *StatusError
+	if errors.As(err, &se) {
 		return se.Code, true
 	}
 	return StatusOK, false
