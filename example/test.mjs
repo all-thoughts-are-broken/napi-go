@@ -691,6 +691,25 @@ check("host executable with another name (nothing is tied to \"node.exe\")", () 
   }
 });
 
+check("js layer (a JavaScript exception passes through without a stray log line)", () => {
+  // The js package reports failures by panicking. When the failure is a
+  // JavaScript exception thrown by a callee, that exception is already pending
+  // and is what the caller must see — untouched, and without the binding
+  // writing a "could not throw" complaint to stderr on the way.
+  const r = runIsolated(`
+    const addon = require(process.argv[1]);
+    try {
+      addon.jsDemo({ greeting: "hi", times: 1, shout() { throw new RangeError("boom from JS"); } });
+      console.log("NO_EXCEPTION");
+    } catch (e) {
+      console.log("CAUGHT", e.constructor.name, e.message);
+    }
+  `);
+  assert.strictEqual(r.status, 0, r.describe());
+  assert.match(r.stdout, /CAUGHT RangeError boom from JS/, r.describe());
+  assert.strictEqual(r.stderr.trim(), "", r.describe());
+});
+
 // Let every promise settle, then report.
 Promise.allSettled(pending).then(() => {
   if (process.exitCode) {

@@ -87,6 +87,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the executable, then `libnode.dll`, then `node.dll`. A function the host does
   not export fails with `napi_generic_failure` and an error that says why. See
   "How the Node-API functions are found on Windows" in `docs/DESIGN.md`.
+- **Every JavaScript exception that crossed the `js` layer wrote a "could not
+  throw" line to stderr.** The `js` package reports failures by panicking, and
+  a callee's exception arrives as a panic carrying `napi_pending_exception`.
+  The callback trampoline tried to throw that panic as a new error, was refused
+  because an exception was already pending, and logged the refusal — while the
+  original exception propagated correctly all along. A panic that carries
+  `napi_pending_exception` while an exception really is pending is now
+  recognised as that exception on its way up and left alone.
 
 ### Removed
 

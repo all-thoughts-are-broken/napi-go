@@ -6,6 +6,7 @@ package napi
 import "C"
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"runtime/cgo"
@@ -88,6 +89,9 @@ func unwrapPayload(p unsafe.Pointer) any {
 // panicToJS converts a recovered panic into a pending JS exception so that
 // a Go panic never takes down the Node.js process.
 func panicToJS(env Env, r any) {
+	if carriesPendingException(env, r) {
+		return
+	}
 	msg := fmt.Sprint(r)
 	cmsg := C.CString(msg)
 	defer C.free(unsafe.Pointer(cmsg))
@@ -96,6 +100,33 @@ func panicToJS(env Env, r any) {
 		// in a context where throwing is impossible). Log and move on.
 		fmt.Fprintf(os.Stderr, "node-api: recovered panic (%s) and could not throw: %v\n", msg, st)
 	}
+}
+
+// carriesPendingException reports whether a recovered panic is a JavaScript
+// exception on its way up rather than a failure of its own.
+//
+// Code that panics on error — the js package does — turns a callee's exception
+// into a panic whose value is the napi_pending_exception status. The exception
+// itself is still pending on the environment, and that is what the JavaScript
+// caller has to receive. There is nothing to throw: throwing would be refused
+// (an exception is already pending), which used to be logged as "could not
+// throw" on every exception that crossed the js layer. Both conditions are
+// checked, so a panic is only passed over when the exception that replaces it
+// really is there.
+func carriesPendingException(env Env, r any) bool {
+	err, ok := r.(error)
+	if !ok {
+		return false
+	}
+	var se *StatusError
+	if !errors.As(err, &se) || se.Code != StatusPendingException {
+		return false
+	}
+	var pending C.bool
+	if C.napi_is_exception_pending(C.napi_env(env), &pending) != C.napi_ok {
+		return false
+	}
+	return bool(pending)
 }
 
 // recoverToJS is used as `defer recoverToJS(env)` in trampolines that run on
