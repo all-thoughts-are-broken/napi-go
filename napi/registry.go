@@ -6,6 +6,7 @@ package napi
 import "C"
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"runtime/cgo"
@@ -88,6 +89,9 @@ func unwrapPayload(p unsafe.Pointer) any {
 // panicToJS converts a recovered panic into a pending JS exception so that
 // a Go panic never takes down the Node.js process.
 func panicToJS(env Env, r any) {
+	if carriesPendingException(env, r) {
+		return
+	}
 	msg := fmt.Sprint(r)
 	cmsg := C.CString(msg)
 	defer C.free(unsafe.Pointer(cmsg))
@@ -96,6 +100,33 @@ func panicToJS(env Env, r any) {
 		// in a context where throwing is impossible). Log and move on.
 		fmt.Fprintf(os.Stderr, "node-api: recovered panic (%s) and could not throw: %v\n", msg, st)
 	}
+}
+
+// carriesPendingException reports whether a recovered panic is a JavaScript
+// exception on its way up rather than a failure of its own.
+//
+// Code that panics on error — the js package does — turns a callee's exception
+// into a panic whose value is the napi_pending_exception status. The exception
+// itself is still pending on the environment, and that is what the JavaScript
+// caller has to receive. There is nothing to throw: throwing would be refused
+// (an exception is already pending), which used to be logged as "could not
+// throw" on every exception that crossed the js layer. Both conditions are
+// checked, so a panic is only passed over when the exception that replaces it
+// really is there.
+func carriesPendingException(env Env, r any) bool {
+	err, ok := r.(error)
+	if !ok {
+		return false
+	}
+	var se *StatusError
+	if !errors.As(err, &se) || se.Code != StatusPendingException {
+		return false
+	}
+	var pending C.bool
+	if C.napi_is_exception_pending(C.napi_env(env), &pending) != C.napi_ok {
+		return false
+	}
+	return bool(pending)
 }
 
 // recoverToJS is used as `defer recoverToJS(env)` in trampolines that run on
@@ -269,6 +300,24 @@ func napiGoCleanupHook(cArg unsafe.Pointer) {
 	fn()
 }
 
+// napiGoEnvShutdown and napiGoEnvGone are the two env cleanup hooks that drop
+// an environment's handle tokens once it has finished shutting down (see
+// "forgetting an environment's handles" in handle_token.go). Their argument is
+// the environment itself, used as an identity; it is not a box and, by the
+// time the second one runs, not a usable environment either.
+//
+//export napiGoEnvShutdown
+func napiGoEnvShutdown(cArg unsafe.Pointer) {
+	defer recoverToLog("environment shutdown hook")
+	envShuttingDown(Env(cArg))
+}
+
+//export napiGoEnvGone
+func napiGoEnvGone(cArg unsafe.Pointer) {
+	defer recoverToLog("environment shutdown hook")
+	envGone(Env(cArg))
+}
+
 // napiGoAsyncCleanupHook is the trampoline for async cleanup hooks.
 //
 // Two invariants, and they pull in opposite directions:
@@ -355,9 +404,12 @@ func napiGoAsyncComplete(cEnv C.napi_env, cStatus C.napi_status, cData unsafe.Po
 	}
 }
 
-// tsfnCall carries the payload of one threadsafe-function dispatch.
+// tsfnCall carries the payload of one threadsafe-function dispatch. owner is
+// the function it was queued on, which is told when the engine takes the
+// payload off the queue.
 type tsfnCall struct {
-	fn func(Env, Value)
+	fn    func(Env, Value)
+	owner *tsfnState
 }
 
 // napiGoTSFNCallJs runs on the JS thread for every queued TSFN call. The
@@ -390,6 +442,11 @@ func napiGoTSFNCallJs(cEnv C.napi_env, cJsCallback C.napi_value, cContext, cData
 	}()
 
 	call, ok := loadBox(cData).(*tsfnCall)
+	if ok && call.owner != nil {
+		// The payload has left the queue, whether to run or to be dropped:
+		// a Call waiting for room can try again.
+		call.owner.noteDispatch()
+	}
 	if !ok || cEnv == nil {
 		// Environment is gone; nothing can be dispatched. The closure is
 		// garbage collected along with the freed box.
@@ -407,4 +464,32 @@ func napiGoTSFNCallJs(cEnv C.napi_env, cJsCallback C.napi_value, cContext, cData
 		defer recoverToJS(env)
 		fn(env, Value(cJsCallback))
 	}()
+}
+
+// napiGoTSFNFinalize is the thread_finalize_cb of every threadsafe function.
+// The engine calls it on the loop thread when the function is being torn down
+// — after the last release, after an abort, or because the environment is
+// shutting down — and always before the engine object is freed. It is the only
+// notice the binding gets, and the only moment at which the engine pointer is
+// known to be valid for the last time; tsfnState.finalize does the work.
+//
+// cData is a box holding the *tsfnState, created by NewThreadsafeFunction.
+//
+//export napiGoTSFNFinalize
+func napiGoTSFNFinalize(cEnv C.napi_env, cData, cHint unsafe.Pointer) {
+	if cData == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "node-api: panic finalizing threadsafe function: %v\n", r)
+		}
+	}()
+	defer freeBox(cData)
+
+	st, ok := loadBox(cData).(*tsfnState)
+	if !ok || st == nil {
+		return
+	}
+	st.finalize()
 }

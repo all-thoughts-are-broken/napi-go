@@ -7,6 +7,13 @@
 #define NAPI_GO_ENTRY_PREAMBLE_H_
 
 #define NAPI_VERSION 8
+
+// Same setting as napi/napi_preamble.h: on Windows the Node-API functions are
+// defined by package napi, not exported from the addon.
+#if defined(_WIN32) && !defined(NAPI_EXTERN)
+#define NAPI_EXTERN
+#endif
+
 #include <node_api.h>
 
 #endif  // NAPI_GO_ENTRY_PREAMBLE_H_

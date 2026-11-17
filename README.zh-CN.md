@@ -51,8 +51,11 @@ addon.add(1, 2); // 3
   加载进任何支持 Node-API 8 的 Node.js（12.22+ / 14.17+ / 16+ 以及更新的版本），
   不必为每个 Node 版本重新构建。
 - **不依赖 Node.js 构建工具链。** 官方 Node-API 头文件内置在 `include/node/`，
-  Windows 上用一个很小的导入桩 `windows/node.lib` 在加载时把 `napi_*` 符号绑定到
-  正在运行的 `node.exe`；Linux / macOS 上由动态加载器从宿主进程解析。
+  不链接任何来自 Node.js 的东西。`napi_*` 函数来自加载插件的那个进程：Linux /
+  macOS 上由动态加载器解析，Windows 上由绑定在插件加载时自己查找。
+- **不要求宿主叫 `node.exe`。** 不按文件名导入任何符号，所以 Windows 产物可以
+  加载进可执行文件叫别的名字的宿主——Electron、单文件可执行程序、改了名的
+  `node`。（已用改名的 `node.exe` 验证。）
 - **不绑定 MSVC。** Node-API 是纯 C ABI，MinGW-w64 gcc 与 clang 和 `cl.exe` 一样
   可用。原理见 [docs/DESIGN.md](docs/DESIGN.md)。
 - **完整 API 面。** `napi` 包导出的 138 个函数与 C API 一一对应，每个都有功能断言。
@@ -70,7 +73,7 @@ addon.add(1, 2); // 3
 | C 工具链 | Windows 用 MinGW-w64 gcc（UCRT 构建）；Linux / macOS 用 gcc 或 clang |
 | Node.js | 任何支持 Node-API 8 的版本（12.22+ / 14.17+ / 16+），推荐 18+ |
 
-除此之外不需要任何东西——头文件与 Windows 导入库都随模块分发。
+除此之外不需要任何东西——头文件随模块分发，也没有需要链接的库。
 
 ## 安装
 
@@ -160,9 +163,11 @@ func Greet(env napi.Env, info napi.CallbackInfo) napi.Value {
 }
 ```
 
-> `Release(napi.Abort)` 之后这个句柄就作废了：引擎会在下一轮事件循环里销毁对象，
-> 此后任何调用——**包括剩余线程的 `Release`**——都会踩已释放内存。绑定因此把
-> abort 之后的全部操作拦成 `napi_closing`。能用普通 `Release` 就尽量别 abort。
+> 线程安全函数在三种情况下结束：最后一个线程 Release、被 abort、或它所在的环境
+> 关闭（创建它的 Worker 结束）。此后所有方法都返回 `napi_closing`，什么都不会再
+> 转发给引擎。循环调用 `Call` 的 goroutine 应当把这个错误当作停止的信号，之后
+> 也不再欠一次 `Release`。`Release(napi.Abort)` 会让函数对所有线程同时结束，包括
+> 还没 Release 的线程——能用普通 `Release` 就尽量别 abort。
 
 ### Promise 与 async work（libuv 线程池）
 
@@ -172,9 +177,11 @@ func SlowDouble(env napi.Env, info napi.CallbackInfo) napi.Value {
 	input, _ := napi.GetValueDouble(env, cb.Args[0])
 
 	promise, deferred, _ := napi.CreatePromise(env)
-	work, _ := napi.NewAsyncWork(env, "slowDouble",
+	var work *napi.AsyncWork
+	work, _ = napi.NewAsyncWork(env, "slowDouble",
 		func(e napi.Env) { /* 在线程池线程上：只能是纯 Go */ },
 		func(e napi.Env, err error) {
+			defer work.Delete(e) // 除此之外没有任何东西会释放这个 work
 			out, _ := napi.CreateDouble(e, input*2)
 			napi.ResolveDeferred(e, deferred, out)
 		})
@@ -183,12 +190,17 @@ func SlowDouble(env napi.Env, info napi.CallbackInfo) napi.Value {
 }
 ```
 
+> work 在被 Delete 之前一直存活。在它自己的 complete 回调里 Delete 是标准写法；
+> 漏掉的话，每次调用都会泄漏这个 work 以及它持有的回调。
+
 ## ABI 策略
 
 - 绑定**只**调用 Node-API 稳定 C ABI（`NAPI_VERSION=8`），不碰 V8 与 C++ 内部。
 - `include/node/` 内置官方 `node_api.h` / `js_native_api.h`（MIT，来自 Node.js 项目）；
-  `windows/node.lib` 是导入桩——只含符号表、不含代码——所以产物会绑定到加载它的
-  那个 `node.exe`。
+  任何平台上都不链接 Node.js 的库。
+- Windows 上插件不从宿主导入任何符号。每个 `napi_*` 函数都是经由一个指针的跳转，
+  指针在插件加载时从当前进程里导出 Node-API 的那个模块填入——所以产物绑定到加载
+  它的进程，不管那个可执行文件叫什么。
 - 刻意**不**绑定 Node-API 9/10 的函数（external string、property key、syntax error 等）：
   那会引入链接期符号依赖，破坏「一次编译、到处加载」的承诺。
 - 运行时可用 `napi.GetVersion(env)` 探测引擎支持的最高 Node-API 版本。
@@ -197,12 +209,17 @@ func SlowDouble(env napi.Env, info napi.CallbackInfo) napi.Value {
 
 | 平台 | 链接方式 | 状态 |
 |---|---|---|
-| Windows x64 | 链接内置的 `windows/node.lib` 导入桩 | ✅ 已验证 |
-| Linux x64 / arm64 | 不链接任何库；`-Wl,--unresolved-symbols=ignore-all`，`dlopen` 时由宿主进程解析符号 | ✅ CI 构建并测试 |
-| macOS x64 / arm64 | `-Wl,-undefined,dynamic_lookup` | ✅ CI 构建并测试 |
+| Windows x64 | 不链接任何库；`napi_*` 函数在插件加载时绑定到宿主进程 | ✅ 已验证 |
+| Linux x64 | 不链接任何库；`-Wl,--unresolved-symbols=ignore-all`，`dlopen` 时由宿主进程解析符号 | ✅ CI 构建并测试 |
+| Linux arm64 | 同 Linux x64 | 不在 CI 矩阵里 |
+| macOS arm64 | `-Wl,-undefined,dynamic_lookup` | ✅ CI 构建并测试 |
+| macOS x64 | 同 macOS arm64 | 不在 CI 矩阵里 |
 
 Linux 与 macOS 的宿主进程本身导出 `napi_*` 符号，动态加载器会自动解析，因此不需要
 额外文件。在这两个平台上构建只需要 Go 和 C 编译器。
+
+Windows 的方案没有任何与架构相关的部分，所以 arm64 与 x86 不再像以前那样被一个
+仅 x64 的导入库挡住——但目前只构建并运行过 x64。
 
 工具链说明：
 
@@ -228,15 +245,18 @@ Linux 与 macOS 的宿主进程本身导出 `napi_*` 符号，动态加载器会
 - Buffer / ArrayBuffer 返回的 `[]byte` 视图只在 JS 对象存活且未 detach 时有效，
   不要长期持有。
 - 同步 JS↔Go 重入深度受 V8 JS 栈限制（数百层以内）；深递归请异步化。
-- worker_threads 下所有 Worker 必须 require **同一个 addon 文件路径**——每个副本都会
-  在一个进程里实例化第二个 Go runtime，属未定义行为且必然崩溃。
+- worker_threads 下请让所有 Worker require **同一个 addon 文件路径**，这样所有环境
+  共享一个 Go runtime。addon 在加载时会把自己钉在内存里，所以唯一加载它的 Worker
+  退出后它依然存活。每个文件副本都是一个独立的 Go runtime，状态互不相通，并且
+  永远不会被卸载。
 
 每条规则背后的完整推理与实测数据见 [docs/DESIGN.zh-CN.md](docs/DESIGN.zh-CN.md)。
 
 ## 测试
 
 ```sh
-# 功能断言（覆盖全部 138 个导出函数）
+# 功能检查：覆盖全部 138 个导出函数，外加各自在子进程里运行的进程生命周期用例
+# （worker 销毁、改名的宿主等）
 go build -buildmode=c-shared -o example/goaddon.node ./example
 node --expose-gc example/test.mjs
 
@@ -253,19 +273,19 @@ node --expose-gc probe/edge.mjs
 go test -race ./napi/...
 ```
 
-当前状态：功能断言 **71/71**、压测 **18/18**、`-race` 通过、探针套件 **0 bug**
+当前状态：功能检查 **79/79**、压测 **18/18**、`-race` 通过、探针套件 **0 bug**
 （探针剩余的 note 都是已记录的引擎行为，不是绑定缺陷）。
 
-CI 会在 Linux、macOS、Windows 三平台 × Node.js 18/20/22/24 上跑功能套件，
-并额外跑一次压测、探针与 race 检测。
+CI 会在 Linux x64、macOS arm64、Windows x64 × Node.js 18/20/22/24 上跑功能套件，
+并在 Linux 上额外跑一次压测、探针与 race 检测。
 
 ## 版本策略
 
 遵循[语义化版本](https://semver.org/lang/zh-CN/)，发布记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 因为产物面向 Node-API 稳定 ABI，升级 Node.js 不需要重新编译。升级*头文件*是可选的：
-用更新的 Node.js 版本替换 `include/node/` 下的四个头文件，并从
-`https://nodejs.org/dist/v<版本>/win-x64/node.lib` 更新 `windows/node.lib`。
+用更新的 Node.js 版本替换 `include/node/` 下的四个头文件，然后运行
+`go generate ./napi` 刷新 Windows 构建所绑定的函数列表。
 
 ## 参与贡献
 
@@ -281,5 +301,4 @@ go test -race ./napi/...
 
 ## 许可证
 
-[MIT](LICENSE)。内置的 Node.js 头文件与 `windows/node.lib` 原样分发，遵循 Node.js
-项目的 MIT 许可证；详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+[MIT](LICENSE)。内置的 Node.js 头文件原样分发，遵循 Node.js 项目的 MIT 许可证；详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

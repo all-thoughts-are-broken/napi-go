@@ -1,9 +1,37 @@
 // End-to-end test for the napi-go example addon.
 // Run: node --test test.mjs   (or plain: node test.mjs)
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { chmodSync, copyFileSync, mkdtempSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 const require = createRequire(import.meta.url);
 const addon = require("./goaddon.node");
+const ADDON_PATH = fileURLToPath(new URL("./goaddon.node", import.meta.url));
+
+// runIsolated runs a CommonJS script in a fresh Node.js process, with the
+// addon's path in process.argv[1]. The lifecycle bugs it is used for take the
+// whole process down, so they can only be observed from the outside — and the
+// process running this file has already loaded the addon, which hides the ones
+// that depend on who loaded it.
+function runIsolated(source, ...args) {
+  return runIsolatedIn(process.execPath, source, ...args);
+}
+
+// runIsolatedIn is runIsolated with a chosen Node.js executable.
+function runIsolatedIn(execPath, source, ...args) {
+  const r = spawnSync(execPath, ["--expose-gc", "-e", source, ADDON_PATH, ...args], {
+    encoding: "utf8",
+    timeout: 60_000,
+  });
+  const describe = () =>
+    (r.error ? `could not run: ${r.error.message}\n     ` : "") +
+    `exit status ${r.status === null ? `signal ${r.signal}` : `0x${(r.status >>> 0).toString(16)}`}` +
+    `\n     stdout: ${(r.stdout ?? "").trim()}\n     stderr: ${(r.stderr ?? "").trim()}`;
+  return { ...r, describe };
+}
 
 let passed = 0;
 const pending = [];
@@ -500,6 +528,229 @@ check("dataViewInfoDemo (GetDataViewInfo)", () => {
   assert.strictEqual(r.byteLength, 4);
   assert.strictEqual(r.sum, 3 + 4 + 5 + 6);
   assert.strictEqual(r.hasArrayBuffer, true);
+});
+
+// ---- process lifecycle --------------------------------------------------------
+// Each of these runs in its own process (see runIsolated).
+
+check("worker-only load (the addon outlives the only environment that loaded it)", () => {
+  // Node.js closes an addon's library handle when the environment that loaded
+  // it goes away. If no other environment holds the addon, that is the last
+  // reference: without a pin the library is unmapped underneath the Go runtime,
+  // whose threads are still running.
+  const script = `
+    const { Worker } = require("node:worker_threads");
+    const [original, workerAddon, mainLoadsOriginal] = process.argv.slice(1);
+    if (mainLoadsOriginal) require(original);
+    const load = () => new Promise((resolve, reject) => {
+      const w = new Worker(
+        "const { workerData, parentPort } = require('node:worker_threads');" +
+        "parentPort.postMessage(require(workerData).add(1, 2));",
+        { eval: true, workerData: workerAddon });
+      let sum;
+      w.on("message", (m) => { sum = m; });
+      w.on("error", reject);
+      w.on("exit", () => resolve(sum));
+    });
+    (async () => {
+      const first = await load();
+      await new Promise((r) => setTimeout(r, 300)); // Go's own threads keep running
+      const second = await load();                  // and the addon loads again
+      console.log("SURVIVED", first, second);
+    })();
+  `;
+  const survives = (...args) => {
+    const r = runIsolated(script, ...args);
+    assert.strictEqual(r.status, 0, r.describe());
+    assert.match(r.stdout, /SURVIVED 3 3/, r.describe());
+  };
+
+  // The addon is required by a Worker and by nothing else.
+  survives(ADDON_PATH);
+
+  // The main thread holds the addon; the Worker loads a private copy of the
+  // file. That copy is a second library with a second Go runtime, held only by
+  // the Worker — the layout that used to be documented as "always crashes".
+  // Asserted on Windows, where it was measured; two Go runtimes in one process
+  // have not been verified elsewhere.
+  if (process.platform === "win32") {
+    const dir = mkdtempSync(join(tmpdir(), "napi-go-copy-"));
+    try {
+      const copy = join(dir, "copy.node");
+      copyFileSync(ADDON_PATH, copy);
+      survives(copy, "main-loads-original");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+check("DefineProperties (methods and accessors outlive the object they were defined on)", () => {
+  // A method read off an object, or an accessor taken from its property
+  // descriptor, is a function in its own right: JavaScript may keep it long
+  // after the object is gone. Its Go callback has to live exactly as long.
+  const r = runIsolated(`
+    const addon = require(process.argv[1]);
+    const tick = () => new Promise((r) => setImmediate(r));
+    (async () => {
+      let map = addon.wrapMap();
+      map.set("lang", "Go");
+      const get = map.get;
+      const size = Object.getOwnPropertyDescriptor(map, "size").get;
+      console.log("NAMES", JSON.stringify([get.name, size.name]));
+      const host = new WeakRef(map);
+      map = null;
+      // No deref() inside the loop: reading a WeakRef keeps its target alive
+      // until the current job ends, which would defeat the collection.
+      for (let i = 0; i < 8; i++) { gc(); await tick(); }
+      console.log("HOST_COLLECTED", host.deref() === undefined);
+      // Hand the allocator plenty of new callbacks: storage freed along with
+      // the host would now belong to one of these.
+      const others = [];
+      for (let i = 0; i < 256; i++) others.push(addon.goFuncDemo());
+      console.log("GET", get("lang"));
+      console.log("SIZE", size.call({}));
+    })();
+  `);
+  assert.strictEqual(r.status, 0, r.describe());
+  assert.match(r.stdout, /HOST_COLLECTED true/, r.describe());
+  assert.match(r.stdout, /GET Go\r?\n/, r.describe());
+  assert.match(r.stdout, /SIZE 1\r?\n/, r.describe());
+});
+
+check("threadsafe function (a goroutine keeps calling after its environment is gone)", () => {
+  // A Worker starts a goroutine that loops over a threadsafe function, and is
+  // then terminated. The engine tears the function down with the environment;
+  // the goroutine knows nothing about that and calls again. It has to be told
+  // (napi_closing), and its release and any later call have to be refused
+  // rather than reach the engine's freed object.
+  const r = runIsolated(`
+    const { Worker } = require("node:worker_threads");
+    const addon = require(process.argv[1]);
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const w = new Worker(
+      "const { workerData, parentPort } = require('node:worker_threads');" +
+      "require(workerData).tsfnTicker(() => {});" +
+      "parentPort.postMessage('started');" +
+      "setInterval(() => {}, 1000);",
+      { eval: true, workerData: process.argv[1] });
+    w.on("message", async () => {
+      await sleep(100);
+      await w.terminate();
+      for (let i = 0; i < 100 && !addon.tsfnTickerReport().done; i++) await sleep(20);
+      console.log("REPORT", JSON.stringify(addon.tsfnTickerReport()));
+    });
+  `);
+  assert.strictEqual(r.status, 0, r.describe());
+  const report = JSON.parse(/REPORT (.*)/.exec(r.stdout)?.[1] ?? "null");
+  assert.deepStrictEqual(report, {
+    done: true,
+    dispatchedSome: true,
+    callErr: "napi_closing",
+    releaseErr: "napi_closing",
+    lateErr: "napi_closing",
+  }, r.describe());
+});
+
+check("threadsafe function (abort wakes every blocked caller)", () => {
+  // Four goroutines wait behind a full queue of one; the function is aborted.
+  // Each of them has to come back with napi_closing.
+  const r = runIsolated(`
+    const addon = require(process.argv[1]);
+    console.log("RESULT", JSON.stringify(addon.tsfnAbortBlocked(() => {}, 4)));
+  `);
+  assert.strictEqual(r.status, 0, r.describe());
+  const result = JSON.parse(/RESULT (.*)/.exec(r.stdout)?.[1] ?? "null");
+  assert.deepStrictEqual(result, {
+    first: "ok",
+    second: "napi_queue_full",
+    abort: "ok",
+    blocked: ["napi_closing", "napi_closing", "napi_closing", "napi_closing"],
+  }, r.describe());
+});
+
+check("host executable with another name (nothing is tied to \"node.exe\")", () => {
+  // The addon is loaded by a copy of this Node.js binary under a different
+  // file name — what Electron, a single-executable application or a renamed
+  // node look like to it. A Windows addon that imports its Node-API functions
+  // from "node.exe" cannot load there, or worse, loads a second Node.js found
+  // on PATH and calls into that.
+  const dir = mkdtempSync(join(tmpdir(), "napi-go-host-"));
+  try {
+    const host = join(dir, process.platform === "win32" ? "renamed-host.exe" : "renamed-host");
+    copyFileSync(process.execPath, host);
+    chmodSync(host, 0o755);
+    const r = runIsolatedIn(host, `
+      const addon = require(process.argv[1]);
+      console.log("LOADED", addon.add(1, 2), addon.hello("host"));
+    `);
+    assert.strictEqual(r.status, 0, r.describe());
+    assert.match(r.stdout, /LOADED 3 hello, host/, r.describe());
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("js layer (a JavaScript exception passes through without a stray log line)", () => {
+  // The js package reports failures by panicking. When the failure is a
+  // JavaScript exception thrown by a callee, that exception is already pending
+  // and is what the caller must see — untouched, and without the binding
+  // writing a "could not throw" complaint to stderr on the way.
+  const r = runIsolated(`
+    const addon = require(process.argv[1]);
+    try {
+      addon.jsDemo({ greeting: "hi", times: 1, shout() { throw new RangeError("boom from JS"); } });
+      console.log("NO_EXCEPTION");
+    } catch (e) {
+      console.log("CAUGHT", e.constructor.name, e.message);
+    }
+  `);
+  assert.strictEqual(r.status, 0, r.describe());
+  assert.match(r.stdout, /CAUGHT RangeError boom from JS/, r.describe());
+  assert.strictEqual(r.stderr.trim(), "", r.describe());
+});
+
+check("handles (a finalizer can still delete its reference while the environment shuts down)", () => {
+  // The object dies with the Worker, so its finalizer runs as part of the
+  // environment's shutdown. Deleting a reference there is the documented way
+  // to release one, and has to work right up to the end.
+  const r = runIsolated(`
+    const { Worker } = require("node:worker_threads");
+    const addon = require(process.argv[1]);
+    const w = new Worker(
+      "const addon = require(require('node:worker_threads').workerData);" +
+      "globalThis.keep = {}; addon.holdUntilGone(globalThis.keep, {});",
+      { eval: true, workerData: process.argv[1] });
+    w.on("exit", () => setTimeout(() => console.log("DELETE", addon.holdUntilGoneReport()), 200));
+  `);
+  assert.strictEqual(r.status, 0, r.describe());
+  assert.match(r.stdout, /DELETE ok\r?\n/, r.describe());
+});
+
+check("handles (what an environment never released does not pile up)", () => {
+  // Twenty Workers each leave 5000 references undeleted. The engine frees them
+  // with the environment; the binding's record of them has to go as well. It
+  // used to stay for good, at about 109 bytes a reference — 10 MB here.
+  const r = runIsolated(`
+    const { Worker } = require("node:worker_threads");
+    const addon = require(process.argv[1]);
+    (async () => {
+      const before = addon.goHeapBytes();
+      for (let i = 0; i < 20; i++) {
+        await new Promise((resolve, reject) => {
+          const w = new Worker(
+            "require(require('node:worker_threads').workerData).keepRefs(5000);",
+            { eval: true, workerData: process.argv[1] });
+          w.on("error", reject);
+          w.on("exit", resolve);
+        });
+      }
+      console.log("GROWTH", Math.round(addon.goHeapBytes() - before));
+    })();
+  `);
+  assert.strictEqual(r.status, 0, r.describe());
+  const growth = Number(/GROWTH (-?\d+)/.exec(r.stdout)?.[1] ?? NaN);
+  assert.ok(growth < 3 * 1024 * 1024, `the Go heap grew by ${growth} bytes over 20 Workers\n     ${r.describe()}`);
 });
 
 // Let every promise settle, then report.

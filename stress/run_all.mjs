@@ -275,11 +275,12 @@ if (!process.env.NAPI_STRESS_SKIP_WORKERS) await scenario("16. worker_threads: 4
   const workerSrc = `
     const { createRequire } = require("node:module");
     const { parentPort, workerData } = require("node:worker_threads");
-    // IMPORTANT: every worker must require the SAME addon file as the main
-    // thread. Windows LoadLibrary is per-path: a copied .node file would
-    // load a second instance with a second Go runtime in the same process,
-    // which is unsupported and crashes. Same path => same DLL => one Go
-    // runtime shared across environments (the multi-env design).
+    // Every worker requires the SAME addon file as the main thread. The
+    // loader de-duplicates by path, so same path => same library => one Go
+    // runtime shared across environments, which is the multi-env design this
+    // scenario measures. A copied .node file would be a second library with
+    // its own Go runtime and its own registry: it works, but it is a
+    // different thing to measure.
     const addon = createRequire(__filename)(${JSON.stringify(addonPath)});
     let acc = 0;
     for (let i = 0; i < 500_000; i++) acc += addon.addDoubles(i, 1);

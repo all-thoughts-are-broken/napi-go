@@ -7,8 +7,146 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `AsStatus` sees through wrapped errors (`errors.As`). An error annotated with
+  `fmt.Errorf("...: %w", err)` used to lose its status.
+- `CreateExternalArrayBufferFromBytes` and `CreateExternalBufferFromBytes` pin
+  the slice's storage with `runtime.Pinner` until the buffer is collected.
+  Keeping the slice reachable was already enough to keep the address valid,
+  but only because today's collector never moves heap objects; the cgo rules
+  require Go memory that C keeps a pointer to to be pinned, and now it is.
+
+### Fixed
+
+- **An addon held only by a Worker crashed the process when the Worker
+  exited.** Node.js closes an addon's library handle when the environment that
+  loaded it is destroyed; if nothing else holds the library it is unmapped, and
+  the Go runtime inside it cannot be shut down — its threads keep running in
+  freed memory. Measured on Windows with Node.js 22: `0xC0000005` shortly after
+  the Worker ends, both when the addon is required only inside a Worker and
+  when a Worker loads its own copy of the file. The addon now pins itself in
+  memory when it is loaded: `GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_PIN)`
+  on Windows, an extra `RTLD_NODELETE` reference on macOS. ELF platforms were
+  already covered by the Go linker's `-z nodelete`.
+
+  This also corrects the reasoning behind the "every worker must require the
+  same path" rule. Two copies of the addon required on one thread run side by
+  side, so the crash seen with a copy per worker was the unload, not "multiple
+  Go runtimes in one process". A shared path is still recommended — every copy
+  is a separate runtime with separate state — but doing otherwise no longer
+  crashes.
+- **A method or accessor defined with `DefineProperties` ran the wrong Go
+  callback once its object had been collected.** The callback boxes were tied
+  to the object the properties were defined on, but a method read off that
+  object (`const m = obj.m`) or an accessor taken from its property descriptor
+  is a function of its own, and JavaScript can keep it after the object is gone.
+  Collecting the object freed the boxes underneath those functions, and the next
+  call read recycled storage. Measured: the extracted method returned another
+  function's result, with no error, and the extracted getter failed with
+  "getter data missing".
+
+  Every such function now owns its box, exactly as a `CreateFunction` function
+  does. The binding creates the function itself and defines a method as a data
+  property holding it (what the engine does with a method anyway) and an
+  accessor through `Reflect.defineProperty`. What ends up on the object is
+  unchanged — same keys, same order, same attributes, same statuses on failure —
+  and the debug box counter now shows one box per function instead of one per
+  descriptor plus one per call. `DefineClass` is unaffected: its boxes are tied
+  to the class, which the engine never collects.
+- **A goroutine that used a threadsafe function after its environment had shut
+  down crashed the process.** When a Worker ends, the engine tears down the
+  threadsafe functions it created. The binding registered no finalize callback,
+  so it was never told: its own record still said "live", and the goroutine's
+  next `Call` reached a freed object. Measured on Node.js 22: `0xC0000005`, every
+  time.
+
+  The binding now registers the finalize callback and builds the function's
+  lifetime on it. That callback is the one point at which the engine object is
+  known to be valid for the last time on every Node.js release — Node.js up to
+  24.13 deletes the object right after it, 24.14 and later keep it until every
+  thread has released (`docs/DESIGN.md`, "Known limitations", has the two side
+  by side). Calls into the engine hold a read lock that the finalizer takes for
+  writing; the finalizer hands back the thread counts Go still holds; afterwards
+  every method returns `napi_closing` and nothing is forwarded. A goroutine
+  looping over `Call` sees that error and stops, and the `Release` it would have
+  made is refused instead of faulting.
+
+  Measured on Node.js 22. On the engine that Node.js 24.14 and later ship, the
+  same code path is derived from the engine's source and has not been run
+  locally; CI's Node.js 24 leg runs the checks against it.
+- **An abort left all but one of the goroutines blocked in `Call` blocked for
+  good.** With several callers waiting behind a full queue, the engine wakes one
+  of them when the function closes — `Signal`, where it has to wake them all —
+  and goes on to delete the object the others are waiting on. Measured: four
+  blocked callers, one returned `napi_closing`, three never returned.
+  `Call(..., napi.Blocking)` now waits in Go: the engine is only ever asked to
+  queue without blocking, and a full queue is retried after the next dispatch.
+  Every blocked caller is woken when the function ends.
+- **A Windows addon only loaded into a host whose executable was called
+  `node.exe`.** Linking the `node.exe` import library writes that file name
+  into the addon's import table. Measured with a renamed copy of `node.exe` as
+  the host: `ERR_DLOPEN_FAILED` ("The specified module could not be found"), or
+  — when a `node.exe` is on `PATH` — a silent exit with `0xC0000028`, because the
+  import is then satisfied by that other file instead of the host. Electron,
+  single-executable applications and embedders all have "another name".
+
+  The addon now imports nothing from the host. Each `napi_*` function is defined
+  in the addon as a jump through a pointer, and the pointers are filled in when
+  the addon is loaded, from whichever module of the process exports Node-API:
+  the executable, then `libnode.dll`, then `node.dll`. A function the host does
+  not export fails with `napi_generic_failure` and an error that says why. See
+  "How the Node-API functions are found on Windows" in `docs/DESIGN.md`.
+- **Every JavaScript exception that crossed the `js` layer wrote a "could not
+  throw" line to stderr.** The `js` package reports failures by panicking, and
+  a callee's exception arrives as a panic carrying `napi_pending_exception`.
+  The callback trampoline tried to throw that panic as a new error, was refused
+  because an exception was already pending, and logged the refusal — while the
+  original exception propagated correctly all along. A panic that carries
+  `napi_pending_exception` while an exception really is pending is now
+  recognised as that exception on its way up and left alone.
+- **A panicking `SetInstanceData` finalizer leaked its box.** The release was
+  written inline after the user's callback, and a panic unwinds past it — the
+  mistake already fixed in the other finalizers. Measured: one box left behind
+  per environment torn down. The release is now deferred. The class-property
+  finalizer's unchecked type assertion also takes the `, ok` form the other
+  trampolines use.
+- **Handles an environment never released stayed in the binding's tables for
+  the life of the process.** An environment frees every handle it still owns
+  when it shuts down, but the tokens standing for them were only ever removed
+  by an explicit release. Addons routinely keep references for as long as an
+  environment runs, so every Worker that ended left its tokens behind.
+  Measured: 100 Workers that each kept 5000 references grew the Go heap by
+  52 MB, 109 bytes per reference; now 0.1 MB.
+
+  Tokens record the environment that owns them and are dropped once it has shut
+  down — after its finalizers, not before. A finalizer deleting its own
+  reference is the documented way to release one and still has to find its
+  token; clearing the tables from an ordinary cleanup hook, which runs before
+  those finalizers, turned that `DeleteReference` into `napi_invalid_arg`. The
+  binding registers a second hook from inside the first to get past them. See
+  "Handle identity" in `docs/DESIGN.md`. Cost: one more map lookup per handle,
+  about 30 ns on a handle-scope open/close.
+
+### Removed
+
+- `windows/node.lib`. Nothing is linked against Node.js any more, on any
+  platform, so the 3 MB x64-only import library is gone and with it the reason
+  the Windows build was limited to x64 (other architectures are untested).
+  C code of your own that used *other* symbols of `node.exe` through it —
+  libuv, V8 — now has to bring its own import library.
+
 ### Documented
 
+- The README's async-work example never deleted its work item, so code copied
+  from it leaked the item and its callback box on every call. It now deletes
+  the item from the completion callback, as `example/main.go` always did.
+- The platform table said Linux arm64 and macOS x64 were built and tested in
+  CI. The matrix has Linux x64, macOS arm64 and Windows x64; the table says so.
+- BUILD: a Windows addon can pick up a dependency on the compiler's own runtime
+  DLL (`libmcfgthread-2.dll` with MCF-thread builds of gcc), which makes it load
+  on the build machine only. How to see it, and the static-link flag that
+  removes it.
 - `CreateError` / `CreateTypeError` / `CreateRangeError` take a `code` that
   must be a string or `nil`. Passing `undefined` returns
   `napi_string_expected` — easy to miss, because the call returns a

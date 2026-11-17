@@ -14,15 +14,29 @@ import "unsafe"
 // callback and its registry entry are released when the JS function object
 // is garbage collected.
 func CreateFunction(env Env, name string, cb Callback) (Value, error) {
+	return newCallbackFunction(env, name, cbData{cb: cb}, C.napi_callback(C.napiGoExecuteCallback))
+}
+
+// newCallbackFunction creates a JS function that enters Go through trampoline
+// with d as its callback data.
+//
+// The box holding d belongs to the function object and to nothing else: a
+// finalizer on the function releases it. That is the only lifetime that is
+// right for a callback box. The engine keeps the box pointer inside the
+// function for as long as the function can be called, and a function can be
+// reached from anywhere — stored in a variable, read off the object it was a
+// method of, taken out of a property descriptor — so no other object's death
+// says anything about whether the box is still needed.
+func newCallbackFunction(env Env, name string, d cbData, trampoline C.napi_callback) (Value, error) {
 	cstr := C.CString(name)
 	defer C.free(unsafe.Pointer(cstr))
 
-	box := boxHandle(cbData{cb: cb})
+	box := boxHandle(d)
 
 	var result Value
 	st := C.napi_create_function(
 		C.napi_env(env), cstr, C.size_t(len(name)),
-		C.napi_callback(C.napiGoExecuteCallback), box,
+		trampoline, box,
 		(*C.napi_value)(unsafe.Pointer(&result)),
 	)
 	if st != C.napi_ok {
@@ -38,6 +52,8 @@ func CreateFunction(env Env, name string, cb Callback) (Value, error) {
 	if st != C.napi_ok {
 		// Older engines without napi_add_finalizer would leak here; with
 		// NAPI_VERSION 8 it is always available, so failure is unexpected.
+		// The function is never handed out, so nothing can call it with the
+		// box gone.
 		freeBox(box)
 		return nil, errOf(env, Status(st))
 	}

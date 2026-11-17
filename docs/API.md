@@ -66,7 +66,7 @@ ev, err := napi.CreateError(env, nil, msg) // yes: no code
 | `SetNamedProperty/GetNamedProperty/HasNamedProperty` | by UTF-8 name (convenience) |
 | `SetElement/GetElement/HasElement/DeleteElement` | by index |
 | `GetPrototype` / `GetPropertyNames` / `GetAllPropertyNames` | prototype and key enumeration (configurable mode/filter/conversion) |
-| `DefineProperties(env, object, []PropertyDescriptor)` | batch definition (methods, getters, setters, data). Each descriptor needs a `Name` or `NameValue`, otherwise `napi_invalid_arg` is returned — the engine dereferences a NULL name and crashes. |
+| `DefineProperties(env, object, []PropertyDescriptor)` | batch definition (methods, getters, setters, data). Each descriptor needs a `Name` or `NameValue`, otherwise `napi_invalid_arg` is returned — the engine dereferences a NULL name and crashes. Every method, getter and setter is a function that owns its Go callback, so it stays callable after `object` is collected (`const m = obj.m` is safe to keep). |
 | `ObjectFreeze` / `ObjectSeal` | freeze and seal |
 | `TypeTagObject` / `CheckObjectTypeTag` | 128-bit type tags (native type checking) |
 | `Wrap(env, obj, any, onFinalize)` / `Unwrap` / `RemoveWrap` | attach a Go value to a JS object (with a finalizer). The value and the finalizer share **one box**, so `RemoveWrap` leaves nothing behind, and the finalizer will not run after it. |
@@ -137,12 +137,20 @@ tsfn.Acquire() / Release(mode) / Ref(env) / Unref(env)
   the queue before releasing**: if you release with items still queued, node
   dispatches the backlog with a NULL env and drops it. The binding frees those
   payloads safely, but your closure never runs.
-- **`Release(napi.Abort)` invalidates the handle.** The engine destroys the
-  object on the next event-loop turn, and every later call touches freed memory
-  (measured: a silent exit with `0xC0000028`). The binding therefore rejects all
-  operations after an abort — **including the remaining threads' `Release`** —
-  with `napi_closing`. In a multi-threaded setting, abort only at the very end,
-  or just use plain `Release` and let it wind down naturally.
+- **A function ends in one of three ways**: its last thread releases it, any
+  thread releases it with `napi.Abort`, or its environment shuts down (the
+  Worker that created it ends). From then on every method returns `napi_closing`
+  and nothing is forwarded to the engine — **including the remaining threads'
+  `Release`**, which on Node.js up to 24.13 touches freed memory (measured: a
+  silent exit with `0xC0000028` after an abort, `0xC0000005` for a goroutine
+  calling into a terminated Worker's function). A goroutine that gets
+  `napi_closing` from `Call` should stop; the binding has already handed its
+  thread count back. In a multi-threaded setting, abort only at the very end, or
+  just use plain `Release` and let it wind down naturally.
+- `napi.Blocking` waits in Go, not in the engine: the call is queued without
+  blocking and, when the queue is full, retried after the next dispatch. Every
+  blocked caller is woken when the function ends; the engine's own blocking
+  wakes only one of them.
 - A closure must not capture a `napi.Value` across callbacks. To keep a JS value
   inside the closure, use `napi.CreateReference`.
 - **When your closure calls into JS and that JS throws**, `CallFunction` reports
@@ -209,8 +217,10 @@ guarantees the lifetime).
 
 ## Test coverage
 
-The 71 assertions in `example/test.mjs` exercise every function in the tables
-above. The only exceptions are `FatalError` and `FatalException`: they terminate
+The checks in `example/test.mjs` exercise every function in the tables above;
+its process-lifecycle checks (a Worker ending under a running goroutine, a host
+executable with another name, ...) each run in a child process, because what
+they guard against takes the whole process down. The only exceptions are `FatalError` and `FatalException`: they terminate
 the process by design (`napi_fatal_error` prints and then aborts), so they cannot
 share a single run with the other assertions.
 

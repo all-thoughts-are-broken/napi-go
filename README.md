@@ -52,9 +52,14 @@ addon.add(1, 2); // 3
   stable ABI, so a single build loads on every release that ships Node-API 8
   (12.22+, 14.17+, 16+, and everything newer). No ABI rebuild per Node release.
 - **No Node.js toolchain.** Official Node-API headers are vendored in
-  `include/node/`, and on Windows a small import stub (`windows/node.lib`)
-  resolves the `napi_*` symbols against the running `node.exe` at load time. On
-  Linux and macOS the dynamic loader resolves them from the host process.
+  `include/node/`, and nothing from Node.js is linked. The `napi_*` functions
+  come from the process that loads the addon: the dynamic loader resolves them
+  on Linux and macOS, and on Windows the binding looks them up itself when the
+  addon is loaded.
+- **Not tied to a host named `node.exe`.** Nothing is imported by file name, so
+  a Windows build can load into a host whose executable is called something
+  else — Electron, a single-executable application, a renamed `node`. (Verified
+  with a renamed `node.exe`.)
 - **Not tied to MSVC.** Node-API is a pure C ABI, so MinGW-w64 gcc and clang
   work just as well as `cl.exe`. See
   [docs/DESIGN.md](docs/DESIGN.md) for the reasoning.
@@ -78,7 +83,7 @@ addon.add(1, 2); // 3
 | C toolchain | MinGW-w64 gcc (UCRT) on Windows; gcc or clang on Linux/macOS |
 | Node.js | Any release with Node-API 8 (12.22+, 14.17+, 16+). Node.js 18+ recommended. |
 
-Nothing else — the headers and the Windows import library ship with the module.
+Nothing else — the headers ship with the module, and there is no library to link.
 
 ## Install
 
@@ -169,10 +174,13 @@ func Greet(env napi.Env, info napi.CallbackInfo) napi.Value {
 }
 ```
 
-> `Release(napi.Abort)` invalidates the handle: the engine destroys the object on
-> the next event-loop turn, so every later call — including the remaining
-> threads' `Release` — would touch freed memory. The binding rejects all of
-> them with `napi_closing`. Prefer plain `Release` when you can.
+> A threadsafe function ends when its last thread releases it, when it is
+> aborted, or when its environment shuts down (the Worker that created it
+> ends). From then on every method returns `napi_closing` and nothing reaches
+> the engine. A goroutine looping over `Call` should take that error as its cue
+> to stop; it owes no `Release` afterwards. `Release(napi.Abort)` ends the
+> function for every thread at once, including the ones that have not released
+> yet — prefer plain `Release` when you can.
 
 ### Promises with async work (libuv thread pool)
 
@@ -182,9 +190,11 @@ func SlowDouble(env napi.Env, info napi.CallbackInfo) napi.Value {
 	input, _ := napi.GetValueDouble(env, cb.Args[0])
 
 	promise, deferred, _ := napi.CreatePromise(env)
-	work, _ := napi.NewAsyncWork(env, "slowDouble",
+	var work *napi.AsyncWork
+	work, _ = napi.NewAsyncWork(env, "slowDouble",
 		func(e napi.Env) { /* runs on a pool thread: pure Go only */ },
 		func(e napi.Env, err error) {
+			defer work.Delete(e) // nothing else frees the work item
 			out, _ := napi.CreateDouble(e, input*2)
 			napi.ResolveDeferred(e, deferred, out)
 		})
@@ -193,14 +203,20 @@ func SlowDouble(env napi.Env, info napi.CallbackInfo) napi.Value {
 }
 ```
 
+> A work item lives until it is deleted. Deleting it from its own completion
+> callback is the canonical pattern; without it every call leaks the item and
+> the callbacks it holds.
+
 ## ABI strategy
 
 - The binding calls **only** the Node-API stable C ABI (`NAPI_VERSION=8`) and
   never touches V8 or C++ internals.
 - `include/node/` vendors the official `node_api.h` / `js_native_api.h` headers
-  (MIT, from the Node.js project). `windows/node.lib` is an import stub — it
-  contains symbols only, no code — so the DLL binds to whichever `node.exe`
-  loads it.
+  (MIT, from the Node.js project). No Node.js library is linked on any platform.
+- On Windows the addon imports nothing from the host. Every `napi_*` function
+  is a jump through a pointer that is filled in, when the addon is loaded, from
+  whichever module of the running process exports Node-API — so the addon binds
+  to the process that loads it, whatever its executable is called.
 - Node-API 9/10 functions (external strings, property keys, syntax errors, …)
   are deliberately **not** bound: they would add link-time symbol dependencies
   and break the "build once, load anywhere" guarantee.
@@ -211,13 +227,19 @@ func SlowDouble(env napi.Env, info napi.CallbackInfo) napi.Value {
 
 | Platform | Linking | Status |
 |---|---|---|
-| Windows x64 | Links the bundled `windows/node.lib` import stub | ✅ Verified |
-| Linux x64 / arm64 | No library; `-Wl,--unresolved-symbols=ignore-all`, symbols resolved from the host process at `dlopen` time | ✅ Built and tested in CI |
-| macOS x64 / arm64 | `-Wl,-undefined,dynamic_lookup` | ✅ Built and tested in CI |
+| Windows x64 | Nothing is linked; the `napi_*` functions are bound to the host process when the addon loads | ✅ Verified |
+| Linux x64 | No library; `-Wl,--unresolved-symbols=ignore-all`, symbols resolved from the host process at `dlopen` time | ✅ Built and tested in CI |
+| Linux arm64 | Same as Linux x64 | Not in the CI matrix |
+| macOS arm64 | `-Wl,-undefined,dynamic_lookup` | ✅ Built and tested in CI |
+| macOS x64 | Same as macOS arm64 | Not in the CI matrix |
 
 Because Linux and macOS hosts export the `napi_*` symbols from the main
 executable, the dynamic loader resolves them automatically — no extra files
 needed. Building on those platforms only requires Go and a C compiler.
+
+The Windows scheme has no architecture-specific part, so arm64 and x86 builds
+are not ruled out the way they were by an x64-only import library — but only
+x64 has been built and run.
 
 Toolchain notes:
 
@@ -246,9 +268,11 @@ Toolchain notes:
   the JS object is alive and not detached. Do not hold them long-term.
 - Synchronous JS↔Go reentrancy is bounded by the V8 JS stack (a few hundred
   frames). Deep recursion should be turned into promise- or TSFN-based async.
-- Under `worker_threads`, every worker must `require` the **same addon file
-  path**. A copy of the file per worker instantiates a second Go runtime inside
-  one process, which is undefined and always crashes.
+- Under `worker_threads`, have every worker `require` the **same addon file
+  path**, so that all environments share one Go runtime. The addon pins itself
+  in memory when it is loaded, so it survives the exit of the only Worker that
+  loaded it. A copy of the file per worker is a separate Go runtime with its
+  own state, and no copy is ever unloaded.
 
 See [docs/DESIGN.md](docs/DESIGN.md) for the full reasoning and the measurements
 behind each rule.
@@ -256,7 +280,8 @@ behind each rule.
 ## Testing
 
 ```sh
-# Functional assertions (all 138 exported functions)
+# Functional checks: all 138 exported functions, plus process-lifecycle cases
+# (worker teardown, a renamed host, ...) that each run in a child process
 go build -buildmode=c-shared -o example/goaddon.node ./example
 node --expose-gc example/test.mjs
 
@@ -273,12 +298,13 @@ node --expose-gc probe/edge.mjs
 go test -race ./napi/...
 ```
 
-Current status: **71/71** functional assertions, **18/18** stress scenarios,
+Current status: **79/79** functional checks, **18/18** stress scenarios,
 `-race` clean, and **0 bugs** reported by the probe suites (the remaining probe
 notes are documented engine behaviours, not binding defects).
 
-CI runs the functional suite on Linux, macOS and Windows across Node.js 18, 20,
-22 and 24, and runs the stress and probe suites and the race detector once.
+CI runs the functional suite on Linux x64, macOS arm64 and Windows x64 across
+Node.js 18, 20, 22 and 24, and runs the stress and probe suites and the race
+detector once, on Linux.
 
 ## Versioning
 
@@ -287,8 +313,8 @@ are in [CHANGELOG.md](CHANGELOG.md).
 
 Because the addon targets the Node-API stable ABI, upgrading Node.js never
 requires a rebuild. Upgrading the *headers* is optional: replace the four files
-under `include/node/` with a newer Node.js release and refresh
-`windows/node.lib` from `https://nodejs.org/dist/v<version>/win-x64/node.lib`.
+under `include/node/` with a newer Node.js release and run `go generate ./napi`
+to refresh the list of functions the Windows build binds.
 
 ## Contributing
 
@@ -305,6 +331,6 @@ and that the functional and stress suites still pass.
 
 ## License
 
-[MIT](LICENSE). The vendored Node.js headers and `windows/node.lib` are
-redistributed unmodified under the Node.js project's MIT license; see
+[MIT](LICENSE). The vendored Node.js headers are redistributed unmodified
+under the Node.js project's MIT license; see
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

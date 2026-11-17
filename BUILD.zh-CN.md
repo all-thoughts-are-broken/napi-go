@@ -10,8 +10,9 @@
 go build -buildmode=c-shared -o addon.node .
 ```
 
-无需安装 Node 头文件，无需 node-gyp：头文件在 `include/node/`，`node.exe` 的
-导入库在 `windows/node.lib`，cgo flags 由 `napi/cgo.go` 自动带上。
+无需安装 Node 头文件，无需 node-gyp，也没有导入库：头文件在 `include/node/`，
+cgo flags 由 `napi/cgo.go` 自动带上。不链接任何 Node.js 的东西——插件在加载它的
+进程里查找 `napi_*` 函数，所以宿主不必叫 `node.exe`。
 
 ## Linux 与 macOS
 
@@ -29,11 +30,19 @@ macOS 上用 `-Wl,-undefined,dynamic_lookup`。两者都已写在 `napi/cgo.go` 
 
 ## 故障排查
 
-- **`gcc: error: unrecognized command-line option '-l:node.lib'`**：所用的
-  链接器不认识 `-l:`。构建默认使用 `-lnode`（GNU ld 与 lld-link 都接受）；
-  看到这个报错说明 `CC` 被换成了非常规驱动。
+- **`napi_generic_failure: the process that loaded this addon does not provide
+  N of the Node-API functions it binds`**（Windows）：插件依次在可执行文件、
+  `libnode.dll`、`node.dll` 里查找 `napi_*` 函数，没有全部找到。要么宿主比
+  Node-API 8 基线更老（Node **12.22**），要么它从别的名字的模块导出 Node-API。
+  报错信息里给出了第一个缺失的函数名。
 - **加载时报 `was compiled against a different Node.js version`**：所用的
   `node.exe` 比 Node-API 8 基线更老，即早于 Node **12.22**。升级 Node.js。
+- **插件在构建机上能加载，换台机器就报「The specified module could not be
+  found」**：它可能依赖了编译器自带、但不属于 Windows 的运行时 DLL。
+  `objdump -p addon.node | grep "DLL Name"` 会列出它需要的 DLL；除了
+  `KERNEL32.dll`、`ntdll.dll` 和 `api-ms-win-crt-*` 那一组之外的都属于工具链
+  （例如 MCF 线程模型的 gcc 带来的 `libmcfgthread-2.dll`）。静态链接进去即可：
+  `go build -buildmode=c-shared -ldflags "-extldflags=-static" -o addon.node .`
 - **`require` 时进程崩溃**：确认 gcc 是 UCRT 构建（`gcc --version` 输出应含
   `ucrt`）。MSVCRT 构建的 gcc 未测试。
 - **clang（MSVC target）**：能编译链接（`lld-link`），但加载时挂起——怀疑
@@ -46,11 +55,13 @@ macOS 上用 `-Wl,-undefined,dynamic_lookup`。两者都已写在 `napi/cgo.go` 
 
 本模块刻意做成自包含的，所以升级 Node.js 一般无需任何操作。若要跟进更新的
 头文件集，用某个 Node.js 发行版的版本替换 `include/node/` 下的四个头文件，
-并刷新导入桩：
+然后重新生成 Windows 构建在加载时绑定的函数列表：
 
 ```sh
-curl -LO https://nodejs.org/dist/v<版本>/win-x64/node.lib
-mv node.lib windows/node.lib
+go generate ./napi    # 重写 napi/host_symbols.h；需要 C 编译器
 ```
+
+列表取自 `NAPI_VERSION 8` 下的头文件，所以更新的函数在模块提升目标版本之前不会
+被绑定。
 
 只在确实需要更新的头文件时才这么做；Node-API 8 的 ABI 本身是稳定的。

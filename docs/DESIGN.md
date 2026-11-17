@@ -7,20 +7,20 @@
 ```
 JS (V8)                    C ABI (Node-API 8)                 Go
 ──────                     ──────────────────                 ──
-addon.node  ◄──load──►  node.exe (exports napi_*)  ◄──cgo──►  package napi
+addon.node  ◄──load──►  host process (exports napi_*)  ◄──cgo──►  package napi
    │                                                         │
    │  napi_register_module_v1 ◄───── //export ─────────────  package entry
    │  napiGoExecuteCallback  ◄───── //export ─────────────   callback trampoline
    └── value exchange: napi_value ↔ napi.Value(unsafe.Pointer)
 ```
 
-- **Stable C ABI only.** `NAPI_VERSION=8`, resolved entirely through `node.exe`
-  on Windows and through the host process's dynamic symbols on Linux/macOS.
-  Nothing links against V8 and nothing touches C++.
+- **Stable C ABI only.** `NAPI_VERSION=8`, resolved entirely against the
+  process that loads the addon: by the dynamic loader on Linux/macOS, by the
+  binding itself on Windows (see "How the Node-API functions are found on
+  Windows"). Nothing links against V8 or Node.js and nothing touches C++.
 - **Headers are vendored.** `include/node/` holds the official `node_api.h` /
-  `js_native_api.h` (MIT) and `windows/node.lib` is an import stub (symbol table
-  only, no code). The `#cgo` directives in `napi/cgo.go` wire everything up, so
-  users install no Node.js components at all.
+  `js_native_api.h` (MIT). The `#cgo` directives in `napi/cgo.go` wire them up,
+  so users install no Node.js components at all.
 
 ## How the cgo code is organised
 
@@ -50,10 +50,27 @@ JS calls f(x)
 - **The box.** A pointer slot allocated with C `malloc` holding a `cgo.Handle`.
   This sidesteps Go's `unsafe.Pointer` rules (the uintptr→pointer conversion
   happens in C), so the handle can legally live in a C struct's `void *data`.
-- **Automatic cleanup.** `CreateFunction` registers a `napi_add_finalizer` on the
-  function object; when JS collects it, the finalizer deletes the cgo handle and
-  frees the box. Property-descriptor boxes hang off the host object the same way
-  (`napiGoPropsFinalizeCallback`).
+- **Automatic cleanup: a callback box belongs to its function.** `CreateFunction`
+  registers a `napi_add_finalizer` on the function object; when JS collects it,
+  the finalizer deletes the cgo handle and frees the box. `DefineProperties`
+  follows the same rule for every method, getter and setter: the binding creates
+  the function itself (a method is then defined as a data property holding it,
+  an accessor through `Reflect.defineProperty`), so each one owns its box.
+
+  The boxes used to hang off the *host object* instead, and that was a
+  use-after-free. A method read off an object (`const m = obj.m`) or an accessor
+  taken from its property descriptor is an ordinary function that outlives the
+  object; once the object was collected its boxes were freed, and the next call
+  ran whichever Go callback had been handed the recycled storage. Measured: the
+  extracted method returned another function's result, with no error anywhere.
+  No object's death says anything about whether a function is still callable —
+  only the function's own does.
+
+  `DefineClass` is the one exception, and only because of the engine behaviour
+  described under "Known limitations": prototype members are built from
+  templates, so the binding cannot own those functions, and their boxes are tied
+  to the class constructor (`napiGoPropsFinalizeCallback`). That is sound because
+  the engine never collects a class, so the constructor outlives them all.
 - **One box even with a user finalizer.** `Wrap` / `CreateExternal` /
   `AddFinalizer` / `SetInstanceData` pack "Go value + user finalizer" into a
   single `finalizePayload` box rather than occupying the data slot and the hint
@@ -165,22 +182,76 @@ The fix lives in `napi/handle_token.go`: allocate a Go object per handle and use
 - Each handle kind gets its own token table (`tokenSet`): handing a `Ref` token
   to `CloseHandleScope` is rejected instead of being reinterpreted.
 
+**Tokens go when their environment does — but not a moment earlier.** An
+environment frees every handle it still owns when it shuts down, whether or not
+the addon released them, and addons routinely keep references (a constructor, a
+callback) for as long as the environment runs. Those tokens used to stay in
+their tables for the life of the process: measured with Workers that each kept
+5000 references, 109 bytes per reference were never given back. Each token now
+records the environment that owns it, and the tables are cleared of an
+environment's tokens once it has shut down.
+
+The timing is the delicate part. The environment runs the addon's remaining
+finalizers as the very last step of its shutdown, and a finalizer deleting a
+reference it owns — the documented way to release one — has to find its token.
+An ordinary cleanup hook runs *before* those finalizers; dropping the tokens
+there made that `DeleteReference` return `napi_invalid_arg` (measured). So the
+binding uses two hooks. The first, registered when an environment's first token
+is issued, only registers the second. Node.js drains its cleanup hooks in
+batches, and a hook added during a batch waits for the next one — which comes
+after the hook that tears the Node-API environment down and runs its
+finalizers. The second hook is the one that clears the tables.
+
+Tokens point at a per-environment record rather than at the `napi_env` address,
+because the engine reuses that address for the next environment and a new
+Worker must not be mistaken for the one that just ended. The bookkeeping costs
+one more map lookup per handle: measured, a handle-scope open/close went from
+about 195 ns to about 225 ns.
+
 This is also why `AsyncWork` was correct from the start — it is a Go struct
-pointer, unique by construction. Tokens simply extend the same fact to the
-objects the engine allocates.
+pointer, unique by construction — and why a `ThreadsafeFunction` holds a pointer
+to its Go-side state instead of a token: that state has to exist anyway, and it
+is just as unique. Tokens simply extend the same fact to the objects the engine
+allocates.
 
 ## worker_threads (multiple environments)
 
-Several Workers inside one process share a single Go runtime, provided they
+Several Workers inside one process share a single Go runtime when they
 `require` the **same addon file path** (Windows `LoadLibrary` de-duplicates by
 path and shares the reference count). Stress scenario #16 verifies 4 workers plus
 the main environment, 5 environments total, working concurrently on one runtime.
 
-**Warning: never ship a separate copy of the addon file per worker.** That
-instantiates multiple Go runtimes in one process (signal handlers, TLS, thread
-registration all conflict) and always crashes. An early version of the stress
-suite made this mistake: a 100% reproducible segmentation fault that disappeared
-once the path was shared.
+**The addon pins itself in memory when it is loaded.** Node.js closes an
+addon's library handle when the environment that loaded it is destroyed. If that
+environment was the only holder — the addon was required only inside a Worker,
+or the Worker loaded its own copy of the file — the close is the last reference
+and the library is unmapped. The Go runtime inside it cannot be shut down: its
+scheduler, collector and monitor threads are still running, now in freed memory.
+Measured on Windows with Node.js 22:
+
+| Layout | Without the pin | With the pin |
+| --- | --- | --- |
+| Same path in the main thread and the workers | works (the main thread keeps the reference) | works |
+| Required only by a Worker | `0xC0000005` after the Worker exits | works, and loads again later |
+| Main thread holds the file, the Worker a copy of it | `0xC0000005` after the Worker exits | works |
+| Two copies required on one thread | works | works |
+
+The last row is what identifies the cause: two Go runtimes in one process run
+side by side, so it is the unload that crashes, not the second runtime. An early
+version of the stress suite loaded a copy per worker and hit a 100% reproducible
+segmentation fault, which was put down to "multiple Go runtimes conflict";
+sharing the path made it disappear only because the main thread then held the
+library.
+
+`napi/pin_windows.go` pins with `GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_PIN)`.
+`napi/pin_darwin.go` takes an extra `dlopen` reference with `RTLD_NODELETE`; it
+is the same idea but has not been measured the way the Windows path has — the
+worker-only check in the functional suite exercises it in CI. ELF platforms need
+nothing: the Go linker already links a c-shared library with `-z nodelete`.
+
+A shared path is still the right layout. Every copy is a separate Go runtime
+with its own heap, threads and package-level state — a value one copy stores in
+a Go global is invisible to the other — and no copy is ever unloaded.
 
 ## Registration protocol
 
@@ -191,41 +262,116 @@ once the path was shared.
   `NAPI_MODULE` macro's version probe, which node uses to check ABI
   compatibility.
 
-## Why Windows links against node.lib and nothing else
+## How the Node-API functions are found on Windows
 
-- A PE DLL may not contain unresolved symbols, so Linux's
-  `--unresolved-symbols=ignore-all` route is not available on Windows.
-- `-lnode` locates `node.lib`, and both GNU ld and lld-link understand it — which
-  is why both MinGW gcc and clang can link the addon.
-- `node.lib` declares symbols only and pulls in no implementation; the artifact
-  binds to the host `node.exe` at run time.
+A PE DLL may not contain unresolved symbols, so Linux's
+`--unresolved-symbols=ignore-all` route is not available: every `napi_*`
+function the binding calls has to be defined at link time.
+
+The usual answer is the one this module used to take — link `node.lib`, the
+import library of `node.exe`. That writes the **file name** of the host into the
+addon's import table, and the Windows loader then looks for a module called
+`node.exe`. Measured, with a renamed copy of `node.exe` as the host:
+
+| Host | Result |
+| --- | --- |
+| `node.exe` | loads |
+| any other name, no `node.exe` on `PATH` | `ERR_DLOPEN_FAILED`: "The specified module could not be found" |
+| any other name, a `node.exe` on `PATH` | silent exit, `0xC0000028` |
+
+In the last row the import is satisfied by that other file — a second Node.js
+image, never initialised — instead of by the host. "Any other name" is not
+exotic: it is `electron.exe`, every single-executable application, and any
+embedder. node-gyp works around it with a delay-load hook
+that redirects `node.exe` to the running executable, which needs MSVC's
+delay-load support; GNU `ld` has no equivalent short of shipping
+toolchain-specific delay-import libraries.
+
+So the addon imports nothing from the host (`napi/host_windows.c`):
+
+- Every `napi_*` function is **defined in the addon** as a jump through a
+  function pointer. The list comes from the vendored headers at
+  `NAPI_VERSION 8` (`napi/host_symbols.h`, written by `go generate ./napi`).
+- When the addon is loaded, `napi_go_bind_host` fills the pointers in with
+  `GetProcAddress`, from the first of these that exports Node-API: the
+  executable itself (`node.exe`, `electron.exe`, a single-executable
+  application), then `libnode.dll` (Node.js built as a shared library; the
+  fallback node-gyp's hook uses too) and `node.dll`.
+- A function the host does not export keeps a stand-in that returns
+  `napi_generic_failure`, and the error carries an explanation, so an old host
+  fails with a message instead of a jump through a null pointer.
+
+The headers declare the functions `__declspec(dllexport)` on Windows, which
+would put all of them in the addon's own export table once it defines them;
+`napi_preamble.h` empties `NAPI_EXTERN` to prevent that. The cost of the scheme
+is one indirect jump per call, which does not show up next to the cgo
+transition (measured: the same per-call times before and after).
+
+Measured with a renamed copy of `node.exe`, which now loads the addon and runs
+it. Electron and single-executable applications export Node-API from their
+executable in the same way but have not been tried.
+
+What it changes for callers: C code of your own that calls `napi_*` functions
+directly needs no link flags on Windows — the functions are defined by package
+`napi`, in the same shared library (the `probe` package's raw probes work this
+way). But nothing is linked against the host any more, so code that used *other*
+symbols of `node.exe` through the bundled `node.lib` — libuv, V8 — has to bring
+its own import library.
 
 ## Known limitations
 
-- **After `napi_release_threadsafe_function(..., napi_tsfn_abort)`, a single
-  event-loop turn destroys the object, contradicting the documented thread-count
-  semantics.** Measured with plain Node-API (the raw probe in
-  `probe/bridge.go`, Node.js 22, Windows):
+- **The engine frees a threadsafe function on its own schedule, and two
+  generations of it disagree about when.** Every function that takes the handle
+  dereferences it unchecked, so "when" decides what is a use-after-free
+  (`node_api.cc`, class `ThreadSafeFunction`):
+
+  | Engine | The object is freed | The use-after-free |
+  | --- | --- | --- |
+  | Node.js 18, 20, 22, and 24 up to 24.13 | as soon as it has been finalized, whatever its thread count says | any call after finalization, including the release a thread still "owes" |
+  | Node.js 24.14 and later | once it has been finalized *and* every thread has released | one call more than the threads held |
+
+  Finalization follows the last release, an abort, **or the environment shutting
+  down** — the last with no call from the addon at all. Measured on Node.js
+  22.22.2, Windows:
 
   | Sequence | Result |
   | --- | --- |
-  | `create(2) + abort + release` (same turn, no loop turn) | all `napi_ok` |
-  | `create(2) + abort` → one loop turn → `acquire` | `0xC0000028` |
-  | `create(2) + abort` → one loop turn → `release` | `0xC0000028` |
+  | A goroutine calls a function whose Worker was terminated | `0xC0000005` |
+  | Raw Node-API: `create(2) + abort + release` (same turn, no loop turn) | all `napi_ok` |
+  | Raw Node-API: `create(2) + abort` → one loop turn → `acquire` | `0xC0000028` |
+  | Raw Node-API: `create(2) + abort` → one loop turn → `release` | `0xC0000028` |
+  | Four threads blocked behind a full queue of one, then abort | one returns `napi_closing`, three stay blocked for good |
 
-  Thread counts 1/2/3 and bounded/unbounded queues all behave the same; only "no
-  event-loop turn" is safe. `0xC0000028` is `STATUS_ASSERTION_FAILURE`, which on
-  Windows is the classic symptom of entering a **deleted
-  `CRITICAL_SECTION`** — the engine's mutex went away with the object. The
-  Node-API documentation says the object is destroyed only once every thread has
-  released; the implementation disagrees.
+  `0xC0000028` is `STATUS_ASSERTION_FAILURE`, which on Windows is the classic
+  symptom of entering a **deleted `CRITICAL_SECTION`** — the engine's mutex went
+  away with the object. Thread counts 1/2/3 and bounded/unbounded queues all
+  behave the same. The last row is the engine waking one waiter (`Signal`) where
+  it has to wake them all.
 
-  The binding's response: after an abort, **everything returns `napi_closing`
-  and nothing is forwarded**, including the "remaining threads release" step the
-  documentation recommends for winding down. This does not pin the environment —
-  the engine has already run `ReleaseResources` before destroying the object
-  (`env->Unref()` plus removing the cleanup hook), so the process still exits.
-  The cost is that the engine object itself leaks; it cannot be reclaimed safely.
+  The one thing both generations agree on is the finalize callback: it runs on
+  the loop thread while the object is still allocated. The binding's handling
+  (`tsfnState` in `napi/async.go`) is built on that single point:
+
+  - Every call into the engine holds a read lock; the finalizer takes the write
+    lock, so it waits out the calls already inside the engine and none can start
+    afterwards.
+  - Inside the finalizer the binding hands back every thread count Go still
+    holds. The newer engine can then delete the object at once instead of
+    waiting for releases that will never be forwarded; for the older one it
+    changes nothing. Nothing leaks on either.
+  - From then on **everything returns `napi_closing` and nothing is forwarded**.
+    That holds after an abort too, including the "remaining threads release"
+    step the Node-API documentation recommends for winding down — on the older
+    engines that release is the faulting call.
+  - The engine is never asked to block. `Call(..., napi.Blocking)` queues
+    without blocking and, when the queue is full, waits in Go for a dispatch.
+    That is what makes it possible to wait for the calls in flight, and it wakes
+    every blocked caller when the function ends.
+
+  What remains: code holding a `ThreadsafeFunction` is not told that its
+  environment went away until its next call returns `napi_closing`. All of the
+  above is measured on Node.js 22, the older engine. The newer engine's path is
+  derived from its source; CI runs the same checks on Node.js 24, which ships it.
 
 - Node-API 9/10 APIs (external strings, property keys, syntax errors, module file
   names, …) are deliberately unbound: they would introduce new symbol

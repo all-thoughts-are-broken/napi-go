@@ -14,6 +14,17 @@
 #define NAPI_GO_PREAMBLE_H_
 
 #define NAPI_VERSION 8
+
+// On Windows this package defines the Node-API functions itself
+// (host_windows.c: each one jumps through a pointer bound to the host process
+// at load time), so they are neither imported from node.exe nor meant to be
+// exported from the addon. Left alone, the headers declare them
+// __declspec(dllexport), which would put all of them in the addon's export
+// table.
+#if defined(_WIN32) && !defined(NAPI_EXTERN)
+#define NAPI_EXTERN
+#endif
+
 #include <node_api.h>
 #include <stdlib.h>
 
@@ -30,10 +41,13 @@ extern void napiGoExternalFinalizeCallback(napi_env env, void* finalize_data, vo
 extern void napiGoPropsFinalizeCallback(napi_env env, void* finalize_data, void* finalize_hint);
 extern void napiGoInstanceDataFinalizeCallback(napi_env env, void* finalize_data, void* finalize_hint);
 extern void napiGoCleanupHook(void* arg);
+extern void napiGoEnvShutdown(void* arg);
+extern void napiGoEnvGone(void* arg);
 extern void napiGoAsyncCleanupHook(napi_async_cleanup_hook_handle handle, void* arg);
 extern void napiGoAsyncExecute(napi_env env, void* data);
 extern void napiGoAsyncComplete(napi_env env, napi_status status, void* data);
 extern void napiGoTSFNCallJs(napi_env env, napi_value js_callback, void* context, void* data);
+extern void napiGoTSFNFinalize(napi_env env, void* finalize_data, void* finalize_hint);
 
 // ---- cgo handle boxing ----------------------------------------------------
 // cgo.Handle values (uintptr) are stored in C-allocated boxes so they can be

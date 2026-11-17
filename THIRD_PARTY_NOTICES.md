@@ -11,11 +11,6 @@ included unmodified.
 - `include/node/js_native_api.h`
 - `include/node/js_native_api_types.h`
 
-## Windows import stub
-
-- `windows/node.lib` — a symbol-only import library for the Node.js
-  executable, used when linking on Windows.
-
 ## License
 
 All of the files above originate from the Node.js project,

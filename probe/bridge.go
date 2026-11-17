@@ -2,9 +2,11 @@ package main
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/../include/node
-#cgo windows LDFLAGS: -L${SRCDIR}/../windows -lnode
 #cgo linux LDFLAGS: -Wl,--unresolved-symbols=ignore-all
 #cgo darwin LDFLAGS: -Wl,-undefined,dynamic_lookup
+
+// Windows needs no link flags: the napi_* functions this file calls directly
+// are defined by package napi (host_windows.c), in the same shared library.
 
 #define NAPI_VERSION 8
 #include <node_api.h>

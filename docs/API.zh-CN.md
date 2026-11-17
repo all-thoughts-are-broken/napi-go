@@ -62,7 +62,7 @@ ev, err := napi.CreateError(env, nil, msg) // 对：不带错误码
 | `SetNamedProperty/GetNamedProperty/HasNamedProperty` | 按 UTF-8 名（便捷） |
 | `SetElement/GetElement/HasElement/DeleteElement` | 按索引 |
 | `GetPrototype` / `GetPropertyNames` / `GetAllPropertyNames` | 原型与键枚举（可配 mode/filter/conversion） |
-| `DefineProperties(env, object, []PropertyDescriptor)` | 批量定义（方法/getter/setter/data）。每个描述符必须给 `Name` 或 `NameValue`，否则返回 `napi_invalid_arg`（引擎对 NULL name 是解引用崩溃） |
+| `DefineProperties(env, object, []PropertyDescriptor)` | 批量定义（方法/getter/setter/data）。每个描述符必须给 `Name` 或 `NameValue`，否则返回 `napi_invalid_arg`（引擎对 NULL name 是解引用崩溃）。每个方法、getter、setter 都是拥有自己 Go 回调的函数，`object` 被回收后依然可以调用（`const m = obj.m` 可以放心保留） |
 | `ObjectFreeze` / `ObjectSeal` | 冻结与密封 |
 | `TypeTagObject` / `CheckObjectTypeTag` | 128 位类型标签（native 类型校验） |
 | `Wrap(env, obj, any, onFinalize)` / `Unwrap` / `RemoveWrap` | Go 值挂到 JS 对象（带 finalizer）。值与 finalizer 共用**一个盒子**，所以 `RemoveWrap` 之后不会残留任何盒子；`RemoveWrap` 后 finalizer 不再触发 |
@@ -128,11 +128,16 @@ tsfn.Acquire() / Release(mode) / Ref(env) / Unref(env)
 - `Release` 会让引用计数归零并关闭函数；**注意在队列排空后再 Release**
   （队列未空时关闭，积压 payload 会被 node 以 NULL env 丢弃——绑定会安全释放
   它们，但你的闭包不会执行）。
-- **`Release(napi.Abort)` 之后这个句柄就作废了**：引擎会在下一轮事件循环里
-  销毁对象，此后任何调用都踩已释放内存（实测 `0xC0000028` 无声退出）。绑定因此
-  在 abort 之后把所有操作——**包括剩余线程的 `Release`**——都拦成
-  `napi_closing`。多线程场景请在最后一刻才 abort，或者干脆只用 `Release`
-  模式让它自然收尾。
+- **函数在三种情况下结束**：最后一个线程 Release、任一线程以 `napi.Abort`
+  Release、或它所在的环境关闭（创建它的 Worker 结束）。此后所有方法都返回
+  `napi_closing`，什么都不再转发给引擎——**包括剩余线程的 `Release`**，在
+  Node.js 24.13 及以前它踩的是已释放内存（实测：abort 之后 `0xC0000028` 无声
+  退出；goroutine 调用已终止 Worker 的函数是 `0xC0000005`）。从 `Call` 拿到
+  `napi_closing` 的 goroutine 应当停止；它的线程计数绑定已经替它归还了。多线程
+  场景请在最后一刻才 abort，或者干脆只用 `Release` 模式让它自然收尾。
+- `napi.Blocking` 是在 Go 里等待，而不是在引擎里：调用以非阻塞方式入队，队满时
+  等下一次派发后重试。函数结束时所有被阻塞的调用者都会被唤醒；引擎自己的阻塞
+  只会唤醒其中一个。
 - 闭包持有 `napi.Value` 跨回调是非法的；需要保留 JS 值时在闭包里用
   `napi.CreateReference`。
 - **闭包里调用 JS、而那段 JS 抛异常时**，`CallFunction` 返回
@@ -190,7 +195,9 @@ tsfn.Acquire() / Release(mode) / Ref(env) / Unref(env)
 
 ## 测试覆盖
 
-`example/test.mjs` 的 71 项断言逐个走通上表列出的全部函数，只有
+`example/test.mjs` 的检查逐个走通上表列出的全部函数；其中的进程生命周期检查
+（goroutine 还在运行时 Worker 结束、可执行文件改了名的宿主等）各自在子进程里运行，
+因为它们防范的问题会让整个进程挂掉。只有
 `FatalError` / `FatalException` 例外：它们按设计终止进程
 （`napi_fatal_error` 打印后 abort），无法与其它断言共享一次运行。
 

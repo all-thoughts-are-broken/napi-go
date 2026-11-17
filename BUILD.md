@@ -11,9 +11,10 @@ the mingw-w64 installers).
 go build -buildmode=c-shared -o addon.node .
 ```
 
-No Node.js headers and no node-gyp: the headers live in `include/node/`, the
-`node.exe` import library is `windows/node.lib`, and the cgo flags in
-`napi/cgo.go` add them automatically.
+No Node.js headers, no node-gyp and no import library: the headers live in
+`include/node/` and the cgo flags in `napi/cgo.go` add them automatically.
+Nothing is linked against Node.js — the addon finds the `napi_*` functions in
+the process that loads it, so the host does not have to be called `node.exe`.
 
 ## Linux and macOS
 
@@ -32,13 +33,22 @@ unresolved symbols (`-Wl,--unresolved-symbols=ignore-all`), and on macOS they us
 
 ## Troubleshooting
 
-- **`gcc: error: unrecognized command-line option '-l:node.lib'`** — the linker
-  in use does not understand `-l:`. The build defaults to `-lnode` (accepted by
-  both GNU ld and lld-link); seeing this error means `CC` was overridden with an
-  unusual driver.
+- **`napi_generic_failure: the process that loaded this addon does not provide
+  N of the Node-API functions it binds`** (Windows) — the addon looked for the
+  `napi_*` functions in the executable, then in `libnode.dll` and `node.dll`,
+  and did not find all of them. Either the host is older than the Node-API 8
+  baseline (Node **12.22**), or it exports Node-API from a module with another
+  name. The message names the first missing function.
 - **`was compiled against a different Node.js version` at load time** — the
   `node.exe` in use is older than the Node-API 8 baseline, i.e. earlier than Node
   **12.22**. Upgrade Node.js.
+- **The addon loads on the build machine but not elsewhere ("The specified
+  module could not be found")** — it may depend on a runtime DLL of the compiler
+  that is not part of Windows. `objdump -p addon.node | grep "DLL Name"` lists
+  what it needs; anything beyond `KERNEL32.dll`, `ntdll.dll` and the
+  `api-ms-win-crt-*` set belongs to the toolchain (`libmcfgthread-2.dll` with
+  MCF-thread builds of gcc, for example). Link it in statically:
+  `go build -buildmode=c-shared -ldflags "-extldflags=-static" -o addon.node .`
 - **The process crashes on `require`** — check that gcc is a UCRT build
   (`gcc --version` should mention `ucrt`). MSVCRT builds of gcc are untested.
 - **clang with the MSVC target** compiles and links (via `lld-link`) but the
@@ -53,13 +63,15 @@ unresolved symbols (`-Wl,--unresolved-symbols=ignore-all`), and on macOS they us
 
 The module is self-contained on purpose, so upgrading Node.js normally requires
 no action. To follow a newer header set, replace the four files under
-`include/node/` with the versions from a Node.js release and refresh the import
-stub:
+`include/node/` with the versions from a Node.js release and regenerate the list
+of functions the Windows build binds at load time:
 
 ```sh
-curl -LO https://nodejs.org/dist/v<version>/win-x64/node.lib
-mv node.lib windows/node.lib
+go generate ./napi    # rewrites napi/host_symbols.h; needs a C compiler
 ```
+
+The list is taken from the headers at `NAPI_VERSION 8`, so newer functions stay
+unbound until the version the module targets is raised.
 
 Only do this if you actually need a newer header; the Node-API 8 ABI itself is
 stable.

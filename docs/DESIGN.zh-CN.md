@@ -7,18 +7,18 @@
 ```
 JS (V8)                    C ABI (Node-API 8)                 Go
 ──────                     ──────────────────                 ──
-addon.node  ◄──加载──►  node.exe (napi_* 导出)  ◄──cgo──►  napi 包
+addon.node  ◄──加载──►  宿主进程 (napi_* 导出)  ◄──cgo──►  napi 包
    │                                                        │
    │  napi_register_module_v1 ◄───── //export ────────────  entry 包
    │  napiGoExecuteCallback  ◄───── //export ─────────────  回调蹦床
    └── 值交换：napi_value ↔ napi.Value(unsafe.Pointer)
 ```
 
-- **只依赖稳定 C ABI**：`NAPI_VERSION=8`，全部通过 `node.exe`（Windows）或
-  主程序动态符号（Linux/macOS）解析。不链接 V8、不碰 C++。
-- **头文件内置**：`include/node/` 是官方 `node_api.h` / `js_native_api.h`（MIT），
-  `windows/node.lib` 是导入桩（只含符号表，无代码）。构建时由
-  `napi/cgo.go` 的 `#cgo` 指令自动接线，用户无需安装任何 Node 组件。
+- **只依赖稳定 C ABI**：`NAPI_VERSION=8`，全部针对加载插件的那个进程解析：
+  Linux/macOS 上由动态加载器完成，Windows 上由绑定自己完成（见「Windows 上如何
+  找到 Node-API 函数」）。不链接 V8 和 Node.js、不碰 C++。
+- **头文件内置**：`include/node/` 是官方 `node_api.h` / `js_native_api.h`（MIT）。
+  构建时由 `napi/cgo.go` 的 `#cgo` 指令自动接线，用户无需安装任何 Node 组件。
 
 ## cgo 组织方式
 
@@ -46,9 +46,22 @@ JS 调用 f(x)
 - **盒子（box）**：C malloc 的一个指针槽，存 `cgo.Handle`。这绕开了 Go 的
   `unsafe.Pointer` 规则（uintptr→pointer 转换只发生在 C 里），让句柄可以合法
   存进 C 结构体的 `void* data`。
-- **自动清理**：`CreateFunction` 在函数对象上注册 `napi_add_finalizer`；
-  JS GC 回收函数时，finalizer 删除 cgo handle 并释放盒子。属性描述符的
-  盒子同理挂在宿主对象上（`napiGoPropsFinalizeCallback`）。
+- **自动清理：回调盒子属于它的函数**：`CreateFunction` 在函数对象上注册
+  `napi_add_finalizer`；JS GC 回收函数时，finalizer 删除 cgo handle 并释放盒子。
+  `DefineProperties` 对每个方法、getter、setter 遵循同一条规则：函数由绑定自己
+  创建（方法随后作为持有它的数据属性来定义，访问器通过 `Reflect.defineProperty`
+  定义），于是每个函数拥有自己的盒子。
+
+  这些盒子以前挂在**宿主对象**上，那是一个 use-after-free。从对象上读出的方法
+  （`const m = obj.m`）或从属性描述符里取出的访问器都是普通函数，可以比对象活得
+  久；对象一被回收，盒子就被释放，下一次调用执行的是恰好拿到这块被重用内存的
+  那个 Go 回调。实测：取出的方法返回了另一个函数的结果，全程没有任何报错。
+  任何对象的死亡都说明不了一个函数是否还能被调用——只有函数自己的死亡可以。
+
+  `DefineClass` 是唯一的例外，而且只因为"已知限制"里描述的引擎行为才成立：原型
+  成员由模板构建，绑定无法拥有那些函数，它们的盒子挂在类构造函数上
+  （`napiGoPropsFinalizeCallback`）。这之所以安全，是因为引擎永不回收类，构造函数
+  比它们都活得久。
 - **带用户的 finalizer 时只用一个盒子**：`Wrap` / `CreateExternal` /
   `AddFinalizer` / `SetInstanceData` 把「Go 值 + 用户 finalizer」一起装进
   `finalizePayload{data, fn}` 这个单一盒子，而不是分别占用 data 槽和 hint 槽。
@@ -143,8 +156,28 @@ JS 调用 f(x)
 - 每种句柄一套令牌表（`tokenSet`）：把 `Ref` 令牌交给 `CloseHandleScope`
   会被拒绝，而不是被重新解释。
 
+**令牌随它的环境一起消失——但一刻也不能提前。** 环境关闭时会释放它还拥有的每一个
+句柄，不管 addon 有没有归还；而 addon 通常会把引用（构造函数、回调）一直保留到
+环境结束。这些令牌以前会在表里留到进程结束：用每个保留 5000 个引用的 Worker
+实测，每个引用有 109 字节永远收不回来。现在每个令牌都记录了拥有它的环境，环境
+关闭之后，表里属于它的令牌会被清掉。
+
+微妙之处在时机。环境在关闭的最后一步才运行 addon 剩余的 finalizer，而在
+finalizer 里删除自己持有的引用——文档推荐的释放方式——必须还能找到它的令牌。
+普通的 cleanup hook 运行在这些 finalizer **之前**；在那里清令牌会让这次
+`DeleteReference` 返回 `napi_invalid_arg`（实测）。所以绑定用了两个钩子。第一个
+在环境的第一个令牌发放时注册，它只负责注册第二个。Node.js 是分批执行 cleanup
+hook 的，在某一批执行期间新增的钩子要等到下一批——而下一批排在拆除 Node-API
+环境、运行其 finalizer 的那个钩子之后。真正清表的是第二个钩子。
+
+令牌指向的是每个环境一份的记录，而不是 `napi_env` 的地址，因为引擎会把这个地址
+复用给下一个环境，新的 Worker 不能被当成刚结束的那个。这份记账的代价是每个句柄
+多一次 map 查找：实测一次 handle scope 的打开加关闭从约 195 ns 变为约 225 ns。
+
 这也是为什么 `AsyncWork` 从一开始就是正确的形态——它是 Go 结构体指针，
-天然唯一；令牌只是把同样的事实带给那几种由引擎分配的对象。
+天然唯一；`ThreadsafeFunction` 持有的也是指向 Go 侧状态的指针而不是令牌：那份
+状态本来就必须存在，而且同样唯一。令牌只是把同样的事实带给那几种由引擎分配的
+对象。
 
 ## worker_threads（多环境）
 
@@ -152,9 +185,32 @@ JS 调用 f(x)
 addon 文件路径**（Windows LoadLibrary 按路径去重，引用计数共享）。
 压测 #16 验证 4 环境 + 主环境共 5 个 env 在一个 runtime 下并发工作。
 
-**警告：绝不要给每个 worker 发 addon 文件的独立副本**——那会在一个进程里
-实例化多个 Go runtime（信号处理器、TLS、线程注册互相冲突），必然崩溃。
-压测初期版本犯过这个错，段错误 100% 复现，改为共享路径后消失。
+**addon 在加载时会把自己钉在内存里。** 加载 addon 的环境销毁时，Node.js 会关闭
+它的库句柄。如果那个环境是唯一的持有者——addon 只在 Worker 里被 require，或者
+Worker 加载的是文件的独立副本——这次关闭就是最后一个引用，库被卸载。而库里的
+Go runtime 无法关停：调度器、GC、sysmon 线程还在运行，此时跑在已释放的内存上。
+在 Windows、Node.js 22 上实测：
+
+| 布局 | 不钉住 | 钉住 |
+| --- | --- | --- |
+| 主线程与 worker 用同一路径 | 正常（主线程一直持有引用） | 正常 |
+| 只被 Worker require | Worker 退出后 `0xC0000005` | 正常，之后还能再次加载 |
+| 主线程持有原文件，Worker 加载副本 | Worker 退出后 `0xC0000005` | 正常 |
+| 同一线程 require 两份副本 | 正常 | 正常 |
+
+最后一行说明了根因：一个进程里的两个 Go runtime 可以并存，崩溃来自卸载而不是
+第二个 runtime。压测初期版本给每个 worker 发了一份副本，段错误 100% 复现，当时
+归因为"多个 Go runtime 互相冲突"；改为共享路径后消失，只是因为主线程从此一直
+持有这个库。
+
+`napi/pin_windows.go` 用 `GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_PIN)` 钉住
+模块。`napi/pin_darwin.go` 用 `RTLD_NODELETE` 额外 `dlopen` 一次；思路相同，但没有
+像 Windows 那样实测过——功能测试里的 worker-only 检查会在 CI 里覆盖它。ELF 平台
+无需处理：Go 链接器本来就给 c-shared 库加了 `-z nodelete`。
+
+共享路径仍然是正确的布局。每份副本都是独立的 Go runtime，有自己的堆、线程和
+包级状态——一份副本存进 Go 全局变量的值，另一份看不到——而且任何副本都不会被
+卸载。
 
 ## 注册协议
 
@@ -163,35 +219,97 @@ addon 文件路径**（Windows LoadLibrary 按路径去重，引用计数共享�
 - `node_api_module_get_api_version_v1`：返回 8，等价 NAPI_MODULE 宏的版本
   探针，node 据此校验 ABI 兼容性。
 
-## 为什么不用 node.lib 之外的链接方案（Windows）
+## Windows 上如何找到 Node-API 函数
 
-- PE DLL 不允许未解析符号（Linux 的 `--unresolved-symbols=ignore-all` 路线
-  在 Windows 不可行）。
-- `-lnode` 搜索 `node.lib`：GNU ld 和 lld-link 都支持，因此 MinGW gcc 与
-  clang 均可链接。
-- node.lib 只声明符号，不引入实现；产物运行时绑定到宿主 node.exe。
+PE DLL 不允许未解析符号，所以 Linux 的 `--unresolved-symbols=ignore-all` 路线
+不可行：绑定调用的每个 `napi_*` 函数都必须在链接期有定义。
+
+通常的做法就是本模块以前的做法——链接 `node.lib`，即 `node.exe` 的导入库。这会把
+宿主的**文件名**写进插件的导入表，Windows 加载器随后去找一个叫 `node.exe` 的
+模块。用一份改了名的 `node.exe` 作宿主实测：
+
+| 宿主 | 结果 |
+| --- | --- |
+| `node.exe` | 正常加载 |
+| 其它名字，`PATH` 上没有 `node.exe` | `ERR_DLOPEN_FAILED`：「The specified module could not be found」 |
+| 其它名字，`PATH` 上有 `node.exe` | 无声退出，`0xC0000028` |
+
+最后一行里，满足这个导入的是那份别的文件——第二份 Node.js 映像，从未初始化——
+而不是宿主。「其它名字」并不罕见：`electron.exe`、所有单文件可执行程序、任何
+嵌入方都是。node-gyp 用一个 delay-load 钩子把 `node.exe` 重定向到当前可执行文件来绕开它，
+这需要 MSVC 的 delay-load 支持；GNU `ld` 没有等价物，除非随模块分发与工具链相关
+的 delay-import 库。
+
+所以插件不从宿主导入任何符号（`napi/host_windows.c`）：
+
+- 每个 `napi_*` 函数都**在插件里定义**，实现是经由一个函数指针的跳转。函数列表
+  来自 `NAPI_VERSION 8` 下的内置头文件（`napi/host_symbols.h`，由
+  `go generate ./napi` 生成）。
+- 插件加载时，`napi_go_bind_host` 用 `GetProcAddress` 填入这些指针，来源是下列
+  模块中第一个导出 Node-API 的：可执行文件本身（`node.exe`、`electron.exe`、
+  单文件可执行程序），然后是 `libnode.dll`（以共享库方式构建的 Node.js；
+  node-gyp 的钩子也用这个回退）和 `node.dll`。
+- 宿主没有导出的函数保留一个返回 `napi_generic_failure` 的替身，错误里带有
+  说明，所以过旧的宿主得到的是一条报错，而不是经空指针跳转。
+
+头文件在 Windows 上把这些函数声明为 `__declspec(dllexport)`，插件一旦定义它们，
+它们就会全部进入插件自己的导出表；`napi_preamble.h` 把 `NAPI_EXTERN` 置空来避免
+这一点。这个方案的代价是每次调用多一次间接跳转，在 cgo 切换面前看不出来（实测：
+前后每次调用的耗时相同）。
+
+以上用一份改了名的 `node.exe` 实测，它现在可以加载并运行插件。Electron 和单文件
+可执行程序以同样的方式从可执行文件导出 Node-API，但没有实际试过。
+
+对调用方的影响：你自己的 C 代码如果直接调用 `napi_*` 函数，在 Windows 上不需要
+任何链接参数——这些函数由 `napi` 包定义，就在同一个共享库里（`probe` 包的原始
+探针就是这样工作的）。但现在不再链接宿主的任何东西，所以如果代码曾经通过内置的
+`node.lib` 使用 `node.exe` 的**其它**符号——libuv、V8——就需要自备导入库。
 
 ## 已知限制
 
-- **`napi_release_threadsafe_function(..., napi_tsfn_abort)` 之后的事件循环
-  转身会销毁对象，文档所述的线程计数语义不成立。** 实测（纯 Node-API，
-  `probe/bridge.go` 的原始探针，Node.js 22 / Windows）：
+- **引擎按自己的节奏释放线程安全函数，而且两代引擎对“什么时候”说法不一。**
+  所有接收这个句柄的函数都不加检查地解引用它，所以“什么时候”决定了什么是
+  use-after-free（`node_api.cc`，`ThreadSafeFunction` 类）：
+
+  | 引擎 | 对象何时被释放 | use-after-free 是什么 |
+  | --- | --- | --- |
+  | Node.js 18、20、22，以及 24.13 及以前的 24 | 一旦 finalize 完就释放，不管线程计数是多少 | finalize 之后的任何调用，包括线程还“欠着”的那次 release |
+  | Node.js 24.14 及以后 | finalize 完**并且**所有线程都 release 之后 | 比线程持有数多出来的那一次调用 |
+
+  finalize 发生在最后一次 release、abort **或环境关闭**之后——最后一种情况下
+  addon 根本没有发起任何调用。在 Node.js 22.22.2 / Windows 上实测：
 
   | 序列 | 结果 |
   | --- | --- |
-  | `create(2) + abort + release`（同一轮，不转事件循环） | 全部 `napi_ok` |
-  | `create(2) + abort` → 转一圈 → `acquire` | `0xC0000028` |
-  | `create(2) + abort` → 转一圈 → `release` | `0xC0000028` |
+  | goroutine 调用一个 Worker 已被终止的函数 | `0xC0000005` |
+  | 纯 Node-API：`create(2) + abort + release`（同一轮，不转事件循环） | 全部 `napi_ok` |
+  | 纯 Node-API：`create(2) + abort` → 转一圈 → `acquire` | `0xC0000028` |
+  | 纯 Node-API：`create(2) + abort` → 转一圈 → `release` | `0xC0000028` |
+  | 四个线程阻塞在容量为 1 的满队列后面，然后 abort | 一个返回 `napi_closing`，三个永久阻塞 |
 
-  线程数 1/2/3、队列有界/无界表现一致；只有「不转事件循环」才正常。
-  `0xC0000028` 是 `STATUS_ASSERTION_FAILURE`，在 Windows 上是进入
-  **已删除的 CRITICAL_SECTION** 的典型症状，即引擎的 mutex 已随对象消失。
-  Node-API 文档说 abort 后对象「等所有线程 release 才销毁」，实现并非如此。
+  `0xC0000028` 是 `STATUS_ASSERTION_FAILURE`，在 Windows 上是进入**已删除的
+  CRITICAL_SECTION** 的典型症状，即引擎的 mutex 已随对象消失。线程数 1/2/3、
+  队列有界/无界表现一致。最后一行是引擎只唤醒了一个等待者（`Signal`），而它
+  本该唤醒全部。
 
-  绑定侧的处置：abort 之后**一切都返回 `napi_closing`、什么都不转发**，
-  包括文档推荐用来收尾的那个「剩余线程 Release」。这不会钉住环境——
-  引擎在销毁前已经跑过 `ReleaseResources`（`env->Unref()` + 摘 cleanup hook），
-  所以进程照常退出。代价是那个引擎对象本身泄漏（无法安全回收）。
+  两代引擎唯一一致的地方是 finalize 回调：它在 loop 线程上运行，此时对象还
+  没被释放。绑定的处理（`napi/async.go` 里的 `tsfnState`）就建立在这一个点上：
+
+  - 每次进入引擎的调用都持有读锁；finalizer 拿写锁，于是它会等已经在引擎里的
+    调用返回，此后也不会再有新的调用进去。
+  - 在 finalizer 里，绑定把 Go 还持有的线程计数全部归还。新引擎因此可以立刻
+    删除对象，而不必等那些永远不会被转发的 release；对旧引擎没有任何影响。
+    两边都不泄漏。
+  - 此后**一切都返回 `napi_closing`、什么都不转发**。abort 之后同样如此，包括
+    Node-API 文档推荐用来收尾的那个「剩余线程 Release」——在旧引擎上，出错的
+    正是这次 release。
+  - 绑定从不让引擎阻塞。`Call(..., napi.Blocking)` 以非阻塞方式入队，队满时在
+    Go 里等待下一次派发。正因如此才有可能等待在途的调用，函数结束时也能唤醒
+    每一个被阻塞的调用者。
+
+  剩下的限制：持有 `ThreadsafeFunction` 的代码要到下一次调用返回 `napi_closing`
+  时才知道环境已经没了。以上都是在 Node.js 22（旧引擎）上实测的。新引擎的路径
+  是从它的源码推出来的；CI 会在自带新引擎的 Node.js 24 上运行同样的检查。
 
 - Node-API 9/10 的 API（external string、property key、syntax error、
   module file name 等）刻意未绑定：会引入新符号依赖，破坏"一次编译、全版本
