@@ -182,6 +182,32 @@ The fix lives in `napi/handle_token.go`: allocate a Go object per handle and use
 - Each handle kind gets its own token table (`tokenSet`): handing a `Ref` token
   to `CloseHandleScope` is rejected instead of being reinterpreted.
 
+**Tokens go when their environment does — but not a moment earlier.** An
+environment frees every handle it still owns when it shuts down, whether or not
+the addon released them, and addons routinely keep references (a constructor, a
+callback) for as long as the environment runs. Those tokens used to stay in
+their tables for the life of the process: measured with Workers that each kept
+5000 references, 109 bytes per reference were never given back. Each token now
+records the environment that owns it, and the tables are cleared of an
+environment's tokens once it has shut down.
+
+The timing is the delicate part. The environment runs the addon's remaining
+finalizers as the very last step of its shutdown, and a finalizer deleting a
+reference it owns — the documented way to release one — has to find its token.
+An ordinary cleanup hook runs *before* those finalizers; dropping the tokens
+there made that `DeleteReference` return `napi_invalid_arg` (measured). So the
+binding uses two hooks. The first, registered when an environment's first token
+is issued, only registers the second. Node.js drains its cleanup hooks in
+batches, and a hook added during a batch waits for the next one — which comes
+after the hook that tears the Node-API environment down and runs its
+finalizers. The second hook is the one that clears the tables.
+
+Tokens point at a per-environment record rather than at the `napi_env` address,
+because the engine reuses that address for the next environment and a new
+Worker must not be mistaken for the one that just ended. The bookkeeping costs
+one more map lookup per handle: measured, a handle-scope open/close went from
+about 195 ns to about 225 ns.
+
 This is also why `AsyncWork` was correct from the start — it is a Go struct
 pointer, unique by construction — and why a `ThreadsafeFunction` holds a pointer
 to its Go-side state instead of a token: that state has to exist anyway, and it

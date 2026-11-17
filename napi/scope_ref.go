@@ -63,7 +63,7 @@ func OpenHandleScope(env Env) (HandleScope, error) {
 	if raw == nil {
 		return nil, nil
 	}
-	return HandleScope(handleScopeTokens.issue(unsafe.Pointer(raw))), nil
+	return HandleScope(handleScopeTokens.issue(env, unsafe.Pointer(raw))), nil
 }
 
 // CloseHandleScope closes a scope opened with OpenHandleScope. Closing the
@@ -87,7 +87,7 @@ func OpenEscapableHandleScope(env Env) (EscapableHandleScope, error) {
 	if raw == nil {
 		return nil, nil
 	}
-	return EscapableHandleScope(escapableScopeTokens.issue(unsafe.Pointer(raw))), nil
+	return EscapableHandleScope(escapableScopeTokens.issue(env, unsafe.Pointer(raw))), nil
 }
 
 func CloseEscapableHandleScope(env Env, scope EscapableHandleScope) error {
@@ -156,7 +156,7 @@ func CreateReference(env Env, value Value, initialRefcount uint32) (Ref, error) 
 	if st != C.napi_ok {
 		return nil, errOf(env, Status(st))
 	}
-	return Ref(refTokens.issue(unsafe.Pointer(raw))), nil
+	return Ref(refTokens.issue(env, unsafe.Pointer(raw))), nil
 }
 
 // DeleteReference releases a reference. Must be called on the JS thread, and

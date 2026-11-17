@@ -298,7 +298,7 @@ node --expose-gc probe/edge.mjs
 go test -race ./napi/...
 ```
 
-Current status: **77/77** functional checks, **18/18** stress scenarios,
+Current status: **79/79** functional checks, **18/18** stress scenarios,
 `-race` clean, and **0 bugs** reported by the probe suites (the remaining probe
 notes are documented engine behaviours, not binding defects).
 

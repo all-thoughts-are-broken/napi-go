@@ -111,6 +111,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per environment torn down. The release is now deferred. The class-property
   finalizer's unchecked type assertion also takes the `, ok` form the other
   trampolines use.
+- **Handles an environment never released stayed in the binding's tables for
+  the life of the process.** An environment frees every handle it still owns
+  when it shuts down, but the tokens standing for them were only ever removed
+  by an explicit release. Addons routinely keep references for as long as an
+  environment runs, so every Worker that ended left its tokens behind.
+  Measured: 100 Workers that each kept 5000 references grew the Go heap by
+  52 MB, 109 bytes per reference; now 0.1 MB.
+
+  Tokens record the environment that owns them and are dropped once it has shut
+  down — after its finalizers, not before. A finalizer deleting its own
+  reference is the documented way to release one and still has to find its
+  token; clearing the tables from an ordinary cleanup hook, which runs before
+  those finalizers, turned that `DeleteReference` into `napi_invalid_arg`. The
+  binding registers a second hook from inside the first to get past them. See
+  "Handle identity" in `docs/DESIGN.md`. Cost: one more map lookup per handle,
+  about 30 ns on a handle-scope open/close.
 
 ### Removed
 

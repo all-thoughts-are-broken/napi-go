@@ -89,7 +89,7 @@ func AsyncInit(env Env, asyncResource Value, resourceName string) (AsyncContext,
 	if st != C.napi_ok {
 		return nil, errOf(env, Status(st))
 	}
-	return AsyncContext(asyncContextTokens.issue(unsafe.Pointer(raw))), nil
+	return AsyncContext(asyncContextTokens.issue(env, unsafe.Pointer(raw))), nil
 }
 
 // AsyncDestroy releases an async context. The context must come from
@@ -159,7 +159,7 @@ func OpenCallbackScope(env Env, resourceObject Value, ctx AsyncContext) (Callbac
 	if raw == nil {
 		return nil, nil
 	}
-	return CallbackScope(callbackScopeTokens.issue(unsafe.Pointer(raw))), nil
+	return CallbackScope(callbackScopeTokens.issue(env, unsafe.Pointer(raw))), nil
 }
 
 // CloseCallbackScope closes a scope opened with OpenCallbackScope. Closing it

@@ -300,6 +300,24 @@ func napiGoCleanupHook(cArg unsafe.Pointer) {
 	fn()
 }
 
+// napiGoEnvShutdown and napiGoEnvGone are the two env cleanup hooks that drop
+// an environment's handle tokens once it has finished shutting down (see
+// "forgetting an environment's handles" in handle_token.go). Their argument is
+// the environment itself, used as an identity; it is not a box and, by the
+// time the second one runs, not a usable environment either.
+//
+//export napiGoEnvShutdown
+func napiGoEnvShutdown(cArg unsafe.Pointer) {
+	defer recoverToLog("environment shutdown hook")
+	envShuttingDown(Env(cArg))
+}
+
+//export napiGoEnvGone
+func napiGoEnvGone(cArg unsafe.Pointer) {
+	defer recoverToLog("environment shutdown hook")
+	envGone(Env(cArg))
+}
+
 // napiGoAsyncCleanupHook is the trampoline for async cleanup hooks.
 //
 // Two invariants, and they pull in opposite directions:

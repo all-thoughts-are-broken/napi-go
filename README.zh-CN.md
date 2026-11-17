@@ -273,7 +273,7 @@ node --expose-gc probe/edge.mjs
 go test -race ./napi/...
 ```
 
-当前状态：功能检查 **77/77**、压测 **18/18**、`-race` 通过、探针套件 **0 bug**
+当前状态：功能检查 **79/79**、压测 **18/18**、`-race` 通过、探针套件 **0 bug**
 （探针剩余的 note 都是已记录的引擎行为，不是绑定缺陷）。
 
 CI 会在 Linux x64、macOS arm64、Windows x64 × Node.js 18/20/22/24 上跑功能套件，

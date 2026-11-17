@@ -162,7 +162,7 @@ func CreatePromise(env Env) (promise Value, deferred Deferred, err error) {
 	if st != C.napi_ok {
 		return nil, nil, errOf(env, Status(st))
 	}
-	return promise, Deferred(deferredTokens.issue(unsafe.Pointer(d))), nil
+	return promise, Deferred(deferredTokens.issue(env, unsafe.Pointer(d))), nil
 }
 
 // ResolveDeferred resolves a promise created with CreatePromise. The

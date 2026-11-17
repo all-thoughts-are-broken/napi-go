@@ -41,6 +41,8 @@ extern void napiGoExternalFinalizeCallback(napi_env env, void* finalize_data, vo
 extern void napiGoPropsFinalizeCallback(napi_env env, void* finalize_data, void* finalize_hint);
 extern void napiGoInstanceDataFinalizeCallback(napi_env env, void* finalize_data, void* finalize_hint);
 extern void napiGoCleanupHook(void* arg);
+extern void napiGoEnvShutdown(void* arg);
+extern void napiGoEnvGone(void* arg);
 extern void napiGoAsyncCleanupHook(napi_async_cleanup_hook_handle handle, void* arg);
 extern void napiGoAsyncExecute(napi_env env, void* data);
 extern void napiGoAsyncComplete(napi_env env, napi_status status, void* data);

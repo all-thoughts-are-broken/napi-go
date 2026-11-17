@@ -1,10 +1,11 @@
 package main
 
-// Exports behind the "process lifecycle" checks of test.mjs: what happens to a
-// threadsafe function when the code using it and the environment owning it
-// disagree about how long it lives.
+// Exports behind the "process lifecycle" checks of test.mjs: what happens to
+// threadsafe functions and handles when the code using them and the
+// environment owning them disagree about how long they live.
 
 import (
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -149,8 +150,74 @@ func tsfnAbortBlocked(env napi.Env, info napi.CallbackInfo) napi.Value {
 	return out
 }
 
+// shutdownDelete is what the finalizer installed by holdUntilGone got back from
+// DeleteReference. Like tickerReport, it outlives the environment it is about.
+var shutdownDelete = struct {
+	sync.Mutex
+	status string
+}{status: "the finalizer did not run"}
+
+// holdUntilGone(obj, target) keeps a strong reference to target for as long as
+// obj lives and deletes it from obj's finalizer — the documented way to hold a
+// JS value across callbacks.
+func holdUntilGone(env napi.Env, info napi.CallbackInfo) napi.Value {
+	cb, _ := napi.GetCbInfo(env, info)
+	ref, err := napi.CreateReference(env, cb.Args[1], 1)
+	if err != nil {
+		napi.ThrowError(env, "", err.Error())
+		return nil
+	}
+	err = napi.AddFinalizer(env, cb.Args[0], nil, func(e napi.Env, _ any) {
+		status := statusText(napi.DeleteReference(e, ref))
+		shutdownDelete.Lock()
+		shutdownDelete.status = status
+		shutdownDelete.Unlock()
+	})
+	if err != nil {
+		napi.ThrowError(env, "", err.Error())
+	}
+	return nil
+}
+
+// holdUntilGoneReport() returns what that DeleteReference returned.
+func holdUntilGoneReport(env napi.Env, _ napi.CallbackInfo) napi.Value {
+	shutdownDelete.Lock()
+	defer shutdownDelete.Unlock()
+	out, _ := napi.CreateStringUtf8(env, shutdownDelete.status)
+	return out
+}
+
+// keepRefs(n) creates n references and never deletes them, the way an addon
+// holds per-environment state for as long as the environment runs.
+func keepRefs(env napi.Env, info napi.CallbackInfo) napi.Value {
+	cb, _ := napi.GetCbInfo(env, info)
+	n, _ := napi.GetValueInt32(env, cb.Args[0])
+	for i := int32(0); i < n; i++ {
+		obj, _ := napi.CreateObject(env)
+		if _, err := napi.CreateReference(env, obj, 1); err != nil {
+			napi.ThrowError(env, "", err.Error())
+			return nil
+		}
+	}
+	return nil
+}
+
+// goHeapBytes() returns the Go heap in use after a full collection.
+func goHeapBytes(env napi.Env, _ napi.CallbackInfo) napi.Value {
+	runtime.GC()
+	runtime.GC()
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	out, _ := napi.CreateDouble(env, float64(m.HeapAlloc))
+	return out
+}
+
 func init() {
 	entry.Export("tsfnTicker", tsfnTicker)
 	entry.Export("tsfnTickerReport", tsfnTickerReport)
 	entry.Export("tsfnAbortBlocked", tsfnAbortBlocked)
+	entry.Export("holdUntilGone", holdUntilGone)
+	entry.Export("holdUntilGoneReport", holdUntilGoneReport)
+	entry.Export("keepRefs", keepRefs)
+	entry.Export("goHeapBytes", goHeapBytes)
 }

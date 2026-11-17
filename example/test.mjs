@@ -710,6 +710,49 @@ check("js layer (a JavaScript exception passes through without a stray log line)
   assert.strictEqual(r.stderr.trim(), "", r.describe());
 });
 
+check("handles (a finalizer can still delete its reference while the environment shuts down)", () => {
+  // The object dies with the Worker, so its finalizer runs as part of the
+  // environment's shutdown. Deleting a reference there is the documented way
+  // to release one, and has to work right up to the end.
+  const r = runIsolated(`
+    const { Worker } = require("node:worker_threads");
+    const addon = require(process.argv[1]);
+    const w = new Worker(
+      "const addon = require(require('node:worker_threads').workerData);" +
+      "globalThis.keep = {}; addon.holdUntilGone(globalThis.keep, {});",
+      { eval: true, workerData: process.argv[1] });
+    w.on("exit", () => setTimeout(() => console.log("DELETE", addon.holdUntilGoneReport()), 200));
+  `);
+  assert.strictEqual(r.status, 0, r.describe());
+  assert.match(r.stdout, /DELETE ok\r?\n/, r.describe());
+});
+
+check("handles (what an environment never released does not pile up)", () => {
+  // Twenty Workers each leave 5000 references undeleted. The engine frees them
+  // with the environment; the binding's record of them has to go as well. It
+  // used to stay for good, at about 109 bytes a reference — 10 MB here.
+  const r = runIsolated(`
+    const { Worker } = require("node:worker_threads");
+    const addon = require(process.argv[1]);
+    (async () => {
+      const before = addon.goHeapBytes();
+      for (let i = 0; i < 20; i++) {
+        await new Promise((resolve, reject) => {
+          const w = new Worker(
+            "require(require('node:worker_threads').workerData).keepRefs(5000);",
+            { eval: true, workerData: process.argv[1] });
+          w.on("error", reject);
+          w.on("exit", resolve);
+        });
+      }
+      console.log("GROWTH", Math.round(addon.goHeapBytes() - before));
+    })();
+  `);
+  assert.strictEqual(r.status, 0, r.describe());
+  const growth = Number(/GROWTH (-?\d+)/.exec(r.stdout)?.[1] ?? NaN);
+  assert.ok(growth < 3 * 1024 * 1024, `the Go heap grew by ${growth} bytes over 20 Workers\n     ${r.describe()}`);
+});
+
 // Let every promise settle, then report.
 Promise.allSettled(pending).then(() => {
   if (process.exitCode) {
