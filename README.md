@@ -246,9 +246,11 @@ Toolchain notes:
   the JS object is alive and not detached. Do not hold them long-term.
 - Synchronous JS↔Go reentrancy is bounded by the V8 JS stack (a few hundred
   frames). Deep recursion should be turned into promise- or TSFN-based async.
-- Under `worker_threads`, every worker must `require` the **same addon file
-  path**. A copy of the file per worker instantiates a second Go runtime inside
-  one process, which is undefined and always crashes.
+- Under `worker_threads`, have every worker `require` the **same addon file
+  path**, so that all environments share one Go runtime. The addon pins itself
+  in memory when it is loaded, so it survives the exit of the only Worker that
+  loaded it. A copy of the file per worker is a separate Go runtime with its
+  own state, and no copy is ever unloaded.
 
 See [docs/DESIGN.md](docs/DESIGN.md) for the full reasoning and the measurements
 behind each rule.

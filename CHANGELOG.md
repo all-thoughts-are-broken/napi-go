@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **An addon held only by a Worker crashed the process when the Worker
+  exited.** Node.js closes an addon's library handle when the environment that
+  loaded it is destroyed; if nothing else holds the library it is unmapped, and
+  the Go runtime inside it cannot be shut down — its threads keep running in
+  freed memory. Measured on Windows with Node.js 22: `0xC0000005` shortly after
+  the Worker ends, both when the addon is required only inside a Worker and
+  when a Worker loads its own copy of the file. The addon now pins itself in
+  memory when it is loaded: `GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_PIN)`
+  on Windows, an extra `RTLD_NODELETE` reference on macOS. ELF platforms were
+  already covered by the Go linker's `-z nodelete`.
+
+  This also corrects the reasoning behind the "every worker must require the
+  same path" rule. Two copies of the addon required on one thread run side by
+  side, so the crash seen with a copy per worker was the unload, not "multiple
+  Go runtimes in one process". A shared path is still recommended — every copy
+  is a separate runtime with separate state — but doing otherwise no longer
+  crashes.
+
 ### Documented
 
 - `CreateError` / `CreateTypeError` / `CreateRangeError` take a `code` that

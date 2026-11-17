@@ -228,8 +228,10 @@ Linux 与 macOS 的宿主进程本身导出 `napi_*` 符号，动态加载器会
 - Buffer / ArrayBuffer 返回的 `[]byte` 视图只在 JS 对象存活且未 detach 时有效，
   不要长期持有。
 - 同步 JS↔Go 重入深度受 V8 JS 栈限制（数百层以内）；深递归请异步化。
-- worker_threads 下所有 Worker 必须 require **同一个 addon 文件路径**——每个副本都会
-  在一个进程里实例化第二个 Go runtime，属未定义行为且必然崩溃。
+- worker_threads 下请让所有 Worker require **同一个 addon 文件路径**，这样所有环境
+  共享一个 Go runtime。addon 在加载时会把自己钉在内存里，所以唯一加载它的 Worker
+  退出后它依然存活。每个文件副本都是一个独立的 Go runtime，状态互不相通，并且
+  永远不会被卸载。
 
 每条规则背后的完整推理与实测数据见 [docs/DESIGN.zh-CN.md](docs/DESIGN.zh-CN.md)。
 

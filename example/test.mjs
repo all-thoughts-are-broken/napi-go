@@ -1,9 +1,31 @@
 // End-to-end test for the napi-go example addon.
 // Run: node --test test.mjs   (or plain: node test.mjs)
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { copyFileSync, mkdtempSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 const require = createRequire(import.meta.url);
 const addon = require("./goaddon.node");
+const ADDON_PATH = fileURLToPath(new URL("./goaddon.node", import.meta.url));
+
+// runIsolated runs a CommonJS script in a fresh Node.js process, with the
+// addon's path in process.argv[1]. The lifecycle bugs it is used for take the
+// whole process down, so they can only be observed from the outside — and the
+// process running this file has already loaded the addon, which hides the ones
+// that depend on who loaded it.
+function runIsolated(source, ...args) {
+  const r = spawnSync(process.execPath, ["--expose-gc", "-e", source, ADDON_PATH, ...args], {
+    encoding: "utf8",
+    timeout: 60_000,
+  });
+  const describe = () =>
+    `exit status ${r.status === null ? `signal ${r.signal}` : `0x${(r.status >>> 0).toString(16)}`}` +
+    `\n     stdout: ${r.stdout.trim()}\n     stderr: ${r.stderr.trim()}`;
+  return { ...r, describe };
+}
 
 let passed = 0;
 const pending = [];
@@ -500,6 +522,61 @@ check("dataViewInfoDemo (GetDataViewInfo)", () => {
   assert.strictEqual(r.byteLength, 4);
   assert.strictEqual(r.sum, 3 + 4 + 5 + 6);
   assert.strictEqual(r.hasArrayBuffer, true);
+});
+
+// ---- process lifecycle --------------------------------------------------------
+// Each of these runs in its own process (see runIsolated).
+
+check("worker-only load (the addon outlives the only environment that loaded it)", () => {
+  // Node.js closes an addon's library handle when the environment that loaded
+  // it goes away. If no other environment holds the addon, that is the last
+  // reference: without a pin the library is unmapped underneath the Go runtime,
+  // whose threads are still running.
+  const script = `
+    const { Worker } = require("node:worker_threads");
+    const [original, workerAddon, mainLoadsOriginal] = process.argv.slice(1);
+    if (mainLoadsOriginal) require(original);
+    const load = () => new Promise((resolve, reject) => {
+      const w = new Worker(
+        "const { workerData, parentPort } = require('node:worker_threads');" +
+        "parentPort.postMessage(require(workerData).add(1, 2));",
+        { eval: true, workerData: workerAddon });
+      let sum;
+      w.on("message", (m) => { sum = m; });
+      w.on("error", reject);
+      w.on("exit", () => resolve(sum));
+    });
+    (async () => {
+      const first = await load();
+      await new Promise((r) => setTimeout(r, 300)); // Go's own threads keep running
+      const second = await load();                  // and the addon loads again
+      console.log("SURVIVED", first, second);
+    })();
+  `;
+  const survives = (...args) => {
+    const r = runIsolated(script, ...args);
+    assert.strictEqual(r.status, 0, r.describe());
+    assert.match(r.stdout, /SURVIVED 3 3/, r.describe());
+  };
+
+  // The addon is required by a Worker and by nothing else.
+  survives(ADDON_PATH);
+
+  // The main thread holds the addon; the Worker loads a private copy of the
+  // file. That copy is a second library with a second Go runtime, held only by
+  // the Worker — the layout that used to be documented as "always crashes".
+  // Asserted on Windows, where it was measured; two Go runtimes in one process
+  // have not been verified elsewhere.
+  if (process.platform === "win32") {
+    const dir = mkdtempSync(join(tmpdir(), "napi-go-copy-"));
+    try {
+      const copy = join(dir, "copy.node");
+      copyFileSync(ADDON_PATH, copy);
+      survives(copy, "main-loads-original");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
 });
 
 // Let every promise settle, then report.

@@ -152,9 +152,32 @@ JS 调用 f(x)
 addon 文件路径**（Windows LoadLibrary 按路径去重，引用计数共享）。
 压测 #16 验证 4 环境 + 主环境共 5 个 env 在一个 runtime 下并发工作。
 
-**警告：绝不要给每个 worker 发 addon 文件的独立副本**——那会在一个进程里
-实例化多个 Go runtime（信号处理器、TLS、线程注册互相冲突），必然崩溃。
-压测初期版本犯过这个错，段错误 100% 复现，改为共享路径后消失。
+**addon 在加载时会把自己钉在内存里。** 加载 addon 的环境销毁时，Node.js 会关闭
+它的库句柄。如果那个环境是唯一的持有者——addon 只在 Worker 里被 require，或者
+Worker 加载的是文件的独立副本——这次关闭就是最后一个引用，库被卸载。而库里的
+Go runtime 无法关停：调度器、GC、sysmon 线程还在运行，此时跑在已释放的内存上。
+在 Windows、Node.js 22 上实测：
+
+| 布局 | 不钉住 | 钉住 |
+| --- | --- | --- |
+| 主线程与 worker 用同一路径 | 正常（主线程一直持有引用） | 正常 |
+| 只被 Worker require | Worker 退出后 `0xC0000005` | 正常，之后还能再次加载 |
+| 主线程持有原文件，Worker 加载副本 | Worker 退出后 `0xC0000005` | 正常 |
+| 同一线程 require 两份副本 | 正常 | 正常 |
+
+最后一行说明了根因：一个进程里的两个 Go runtime 可以并存，崩溃来自卸载而不是
+第二个 runtime。压测初期版本给每个 worker 发了一份副本，段错误 100% 复现，当时
+归因为"多个 Go runtime 互相冲突"；改为共享路径后消失，只是因为主线程从此一直
+持有这个库。
+
+`napi/pin_windows.go` 用 `GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_PIN)` 钉住
+模块。`napi/pin_darwin.go` 用 `RTLD_NODELETE` 额外 `dlopen` 一次；思路相同，但没有
+像 Windows 那样实测过——功能测试里的 worker-only 检查会在 CI 里覆盖它。ELF 平台
+无需处理：Go 链接器本来就给 c-shared 库加了 `-z nodelete`。
+
+共享路径仍然是正确的布局。每份副本都是独立的 Go runtime，有自己的堆、线程和
+包级状态——一份副本存进 Go 全局变量的值，另一份看不到——而且任何副本都不会被
+卸载。
 
 ## 注册协议
 

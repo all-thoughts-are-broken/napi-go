@@ -171,16 +171,42 @@ objects the engine allocates.
 
 ## worker_threads (multiple environments)
 
-Several Workers inside one process share a single Go runtime, provided they
+Several Workers inside one process share a single Go runtime when they
 `require` the **same addon file path** (Windows `LoadLibrary` de-duplicates by
 path and shares the reference count). Stress scenario #16 verifies 4 workers plus
 the main environment, 5 environments total, working concurrently on one runtime.
 
-**Warning: never ship a separate copy of the addon file per worker.** That
-instantiates multiple Go runtimes in one process (signal handlers, TLS, thread
-registration all conflict) and always crashes. An early version of the stress
-suite made this mistake: a 100% reproducible segmentation fault that disappeared
-once the path was shared.
+**The addon pins itself in memory when it is loaded.** Node.js closes an
+addon's library handle when the environment that loaded it is destroyed. If that
+environment was the only holder — the addon was required only inside a Worker,
+or the Worker loaded its own copy of the file — the close is the last reference
+and the library is unmapped. The Go runtime inside it cannot be shut down: its
+scheduler, collector and monitor threads are still running, now in freed memory.
+Measured on Windows with Node.js 22:
+
+| Layout | Without the pin | With the pin |
+| --- | --- | --- |
+| Same path in the main thread and the workers | works (the main thread keeps the reference) | works |
+| Required only by a Worker | `0xC0000005` after the Worker exits | works, and loads again later |
+| Main thread holds the file, the Worker a copy of it | `0xC0000005` after the Worker exits | works |
+| Two copies required on one thread | works | works |
+
+The last row is what identifies the cause: two Go runtimes in one process run
+side by side, so it is the unload that crashes, not the second runtime. An early
+version of the stress suite loaded a copy per worker and hit a 100% reproducible
+segmentation fault, which was put down to "multiple Go runtimes conflict";
+sharing the path made it disappear only because the main thread then held the
+library.
+
+`napi/pin_windows.go` pins with `GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_PIN)`.
+`napi/pin_darwin.go` takes an extra `dlopen` reference with `RTLD_NODELETE`; it
+is the same idea but has not been measured the way the Windows path has — the
+worker-only check in the functional suite exercises it in CI. ELF platforms need
+nothing: the Go linker already links a c-shared library with `-z nodelete`.
+
+A shared path is still the right layout. Every copy is a separate Go runtime
+with its own heap, threads and package-level state — a value one copy stores in
+a Go global is invisible to the other — and no copy is ever unloaded.
 
 ## Registration protocol
 
