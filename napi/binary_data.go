@@ -89,9 +89,19 @@ func CreateArrayBuffer(env Env, byteLength uint64) (value Value, data []byte, er
 // Go payload travels through the hint slot and a dedicated finalizer
 // (napiGoExternalFinalizeCallback); it must never be treated as a box.
 func CreateExternalArrayBuffer(env Env, data unsafe.Pointer, byteLength uint64, onFinalize FinalizeFunc, finalData any) (Value, error) {
-	var hint unsafe.Pointer
+	var fd *externalFinalizeData
 	if finalData != nil || onFinalize != nil {
-		hint = boxHandle(&externalFinalizeData{data: finalData, fn: onFinalize})
+		fd = &externalFinalizeData{data: finalData, fn: onFinalize}
+	}
+	return createExternalArrayBuffer(env, data, byteLength, fd)
+}
+
+// createExternalArrayBuffer is CreateExternalArrayBuffer with the finalize
+// data already built (nil when nothing travels with the buffer).
+func createExternalArrayBuffer(env Env, data unsafe.Pointer, byteLength uint64, fd *externalFinalizeData) (Value, error) {
+	var hint unsafe.Pointer
+	if fd != nil {
+		hint = boxHandle(fd)
 	}
 
 	var result Value
@@ -116,12 +126,19 @@ func CreateExternalArrayBuffer(env Env, data unsafe.Pointer, byteLength uint64, 
 //
 // This is the safe form of CreateExternalArrayBuffer for Go-owned memory: the
 // slice travels in finalData by construction, which is exactly the step callers
-// forget when they pass a bare pointer.
+// forget when they pass a bare pointer, and its storage is pinned
+// (runtime.Pinner) until the ArrayBuffer is collected, as the cgo rules require
+// of Go memory that C keeps a pointer to.
 func CreateExternalArrayBufferFromBytes(env Env, b []byte, onFinalize FinalizeFunc) (Value, error) {
 	if len(b) == 0 {
 		return CreateExternalArrayBuffer(env, nil, 0, onFinalize, b)
 	}
-	return CreateExternalArrayBuffer(env, unsafe.Pointer(&b[0]), uint64(len(b)), onFinalize, b)
+	fd := pinnedBytes(b, onFinalize)
+	v, err := createExternalArrayBuffer(env, unsafe.Pointer(&b[0]), uint64(len(b)), fd)
+	if err != nil {
+		fd.unpin() // no buffer was created, so the finalizer will never run
+	}
+	return v, err
 }
 
 func GetArrayBufferInfo(env Env, arrayBuffer Value) (ArrayBufferInfo, error) {
@@ -260,9 +277,19 @@ func CreateBufferCopy(env Env, b []byte) (value Value, err error) {
 //
 // Same hint-based finalizer scheme as CreateExternalArrayBuffer.
 func CreateExternalBuffer(env Env, data unsafe.Pointer, byteLength uint64, onFinalize FinalizeFunc, finalData any) (Value, error) {
-	var hint unsafe.Pointer
+	var fd *externalFinalizeData
 	if finalData != nil || onFinalize != nil {
-		hint = boxHandle(&externalFinalizeData{data: finalData, fn: onFinalize})
+		fd = &externalFinalizeData{data: finalData, fn: onFinalize}
+	}
+	return createExternalBuffer(env, data, byteLength, fd)
+}
+
+// createExternalBuffer is CreateExternalBuffer with the finalize data already
+// built (nil when nothing travels with the buffer).
+func createExternalBuffer(env Env, data unsafe.Pointer, byteLength uint64, fd *externalFinalizeData) (Value, error) {
+	var hint unsafe.Pointer
+	if fd != nil {
+		hint = boxHandle(fd)
 	}
 
 	var result Value
@@ -288,7 +315,12 @@ func CreateExternalBufferFromBytes(env Env, b []byte, onFinalize FinalizeFunc) (
 	if len(b) == 0 {
 		return CreateExternalBuffer(env, nil, 0, onFinalize, b)
 	}
-	return CreateExternalBuffer(env, unsafe.Pointer(&b[0]), uint64(len(b)), onFinalize, b)
+	fd := pinnedBytes(b, onFinalize)
+	v, err := createExternalBuffer(env, unsafe.Pointer(&b[0]), uint64(len(b)), fd)
+	if err != nil {
+		fd.unpin() // no buffer was created, so the finalizer will never run
+	}
+	return v, err
 }
 
 func GetBufferInfo(env Env, buffer Value) (BufferInfo, error) {

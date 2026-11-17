@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `AsStatus` sees through wrapped errors (`errors.As`). An error annotated with
   `fmt.Errorf("...: %w", err)` used to lose its status.
+- `CreateExternalArrayBufferFromBytes` and `CreateExternalBufferFromBytes` pin
+  the slice's storage with `runtime.Pinner` until the buffer is collected.
+  Keeping the slice reachable was already enough to keep the address valid,
+  but only because today's collector never moves heap objects; the cgo rules
+  require Go memory that C keeps a pointer to to be pinned, and now it is.
 
 ### Fixed
 
