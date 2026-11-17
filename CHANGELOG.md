@@ -73,6 +73,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Call(..., napi.Blocking)` now waits in Go: the engine is only ever asked to
   queue without blocking, and a full queue is retried after the next dispatch.
   Every blocked caller is woken when the function ends.
+- **A Windows addon only loaded into a host whose executable was called
+  `node.exe`.** Linking the `node.exe` import library writes that file name
+  into the addon's import table. Measured with a renamed copy of `node.exe` as
+  the host: `ERR_DLOPEN_FAILED` ("The specified module could not be found"), or
+  — when a `node.exe` is on `PATH` — a silent exit with `0xC0000028`, because the
+  import is then satisfied by that other file instead of the host. Electron,
+  single-executable applications and embedders all have "another name".
+
+  The addon now imports nothing from the host. Each `napi_*` function is defined
+  in the addon as a jump through a pointer, and the pointers are filled in when
+  the addon is loaded, from whichever module of the process exports Node-API:
+  the executable, then `libnode.dll`, then `node.dll`. A function the host does
+  not export fails with `napi_generic_failure` and an error that says why. See
+  "How the Node-API functions are found on Windows" in `docs/DESIGN.md`.
+
+### Removed
+
+- `windows/node.lib`. Nothing is linked against Node.js any more, on any
+  platform, so the 3 MB x64-only import library is gone and with it the reason
+  the Windows build was limited to x64 (other architectures are untested).
+  C code of your own that used *other* symbols of `node.exe` through it —
+  libuv, V8 — now has to bring its own import library.
 
 ### Documented
 

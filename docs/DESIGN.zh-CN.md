@@ -7,18 +7,18 @@
 ```
 JS (V8)                    C ABI (Node-API 8)                 Go
 ──────                     ──────────────────                 ──
-addon.node  ◄──加载──►  node.exe (napi_* 导出)  ◄──cgo──►  napi 包
+addon.node  ◄──加载──►  宿主进程 (napi_* 导出)  ◄──cgo──►  napi 包
    │                                                        │
    │  napi_register_module_v1 ◄───── //export ────────────  entry 包
    │  napiGoExecuteCallback  ◄───── //export ─────────────  回调蹦床
    └── 值交换：napi_value ↔ napi.Value(unsafe.Pointer)
 ```
 
-- **只依赖稳定 C ABI**：`NAPI_VERSION=8`，全部通过 `node.exe`（Windows）或
-  主程序动态符号（Linux/macOS）解析。不链接 V8、不碰 C++。
-- **头文件内置**：`include/node/` 是官方 `node_api.h` / `js_native_api.h`（MIT），
-  `windows/node.lib` 是导入桩（只含符号表，无代码）。构建时由
-  `napi/cgo.go` 的 `#cgo` 指令自动接线，用户无需安装任何 Node 组件。
+- **只依赖稳定 C ABI**：`NAPI_VERSION=8`，全部针对加载插件的那个进程解析：
+  Linux/macOS 上由动态加载器完成，Windows 上由绑定自己完成（见「Windows 上如何
+  找到 Node-API 函数」）。不链接 V8 和 Node.js、不碰 C++。
+- **头文件内置**：`include/node/` 是官方 `node_api.h` / `js_native_api.h`（MIT）。
+  构建时由 `napi/cgo.go` 的 `#cgo` 指令自动接线，用户无需安装任何 Node 组件。
 
 ## cgo 组织方式
 
@@ -201,13 +201,51 @@ Go runtime 无法关停：调度器、GC、sysmon 线程还在运行，此时跑
 - `node_api_module_get_api_version_v1`：返回 8，等价 NAPI_MODULE 宏的版本
   探针，node 据此校验 ABI 兼容性。
 
-## 为什么不用 node.lib 之外的链接方案（Windows）
+## Windows 上如何找到 Node-API 函数
 
-- PE DLL 不允许未解析符号（Linux 的 `--unresolved-symbols=ignore-all` 路线
-  在 Windows 不可行）。
-- `-lnode` 搜索 `node.lib`：GNU ld 和 lld-link 都支持，因此 MinGW gcc 与
-  clang 均可链接。
-- node.lib 只声明符号，不引入实现；产物运行时绑定到宿主 node.exe。
+PE DLL 不允许未解析符号，所以 Linux 的 `--unresolved-symbols=ignore-all` 路线
+不可行：绑定调用的每个 `napi_*` 函数都必须在链接期有定义。
+
+通常的做法就是本模块以前的做法——链接 `node.lib`，即 `node.exe` 的导入库。这会把
+宿主的**文件名**写进插件的导入表，Windows 加载器随后去找一个叫 `node.exe` 的
+模块。用一份改了名的 `node.exe` 作宿主实测：
+
+| 宿主 | 结果 |
+| --- | --- |
+| `node.exe` | 正常加载 |
+| 其它名字，`PATH` 上没有 `node.exe` | `ERR_DLOPEN_FAILED`：「The specified module could not be found」 |
+| 其它名字，`PATH` 上有 `node.exe` | 无声退出，`0xC0000028` |
+
+最后一行里，满足这个导入的是那份别的文件——第二份 Node.js 映像，从未初始化——
+而不是宿主。「其它名字」并不罕见：`electron.exe`、所有单文件可执行程序、任何
+嵌入方都是。node-gyp 用一个 delay-load 钩子把 `node.exe` 重定向到当前可执行文件来绕开它，
+这需要 MSVC 的 delay-load 支持；GNU `ld` 没有等价物，除非随模块分发与工具链相关
+的 delay-import 库。
+
+所以插件不从宿主导入任何符号（`napi/host_windows.c`）：
+
+- 每个 `napi_*` 函数都**在插件里定义**，实现是经由一个函数指针的跳转。函数列表
+  来自 `NAPI_VERSION 8` 下的内置头文件（`napi/host_symbols.h`，由
+  `go generate ./napi` 生成）。
+- 插件加载时，`napi_go_bind_host` 用 `GetProcAddress` 填入这些指针，来源是下列
+  模块中第一个导出 Node-API 的：可执行文件本身（`node.exe`、`electron.exe`、
+  单文件可执行程序），然后是 `libnode.dll`（以共享库方式构建的 Node.js；
+  node-gyp 的钩子也用这个回退）和 `node.dll`。
+- 宿主没有导出的函数保留一个返回 `napi_generic_failure` 的替身，错误里带有
+  说明，所以过旧的宿主得到的是一条报错，而不是经空指针跳转。
+
+头文件在 Windows 上把这些函数声明为 `__declspec(dllexport)`，插件一旦定义它们，
+它们就会全部进入插件自己的导出表；`napi_preamble.h` 把 `NAPI_EXTERN` 置空来避免
+这一点。这个方案的代价是每次调用多一次间接跳转，在 cgo 切换面前看不出来（实测：
+前后每次调用的耗时相同）。
+
+以上用一份改了名的 `node.exe` 实测，它现在可以加载并运行插件。Electron 和单文件
+可执行程序以同样的方式从可执行文件导出 Node-API，但没有实际试过。
+
+对调用方的影响：你自己的 C 代码如果直接调用 `napi_*` 函数，在 Windows 上不需要
+任何链接参数——这些函数由 `napi` 包定义，就在同一个共享库里（`probe` 包的原始
+探针就是这样工作的）。但现在不再链接宿主的任何东西，所以如果代码曾经通过内置的
+`node.lib` 使用 `node.exe` 的**其它**符号——libuv、V8——就需要自备导入库。
 
 ## 已知限制
 

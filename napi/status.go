@@ -107,6 +107,12 @@ func errOf(env Env, st Status) error {
 	if env != nil {
 		msg = lastErrorMessage(env)
 	}
+	if why := hostFailure(st); why != "" {
+		// The host lacks some Node-API functions, and this is the status a
+		// missing one answers with. The engine's own message, if any, belongs
+		// to an earlier call; say what is actually wrong.
+		msg = why
+	}
 	return &StatusError{Code: st, Message: msg}
 }
 

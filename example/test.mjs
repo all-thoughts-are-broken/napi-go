@@ -2,7 +2,7 @@
 // Run: node --test test.mjs   (or plain: node test.mjs)
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { copyFileSync, mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdtempSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,13 +17,19 @@ const ADDON_PATH = fileURLToPath(new URL("./goaddon.node", import.meta.url));
 // process running this file has already loaded the addon, which hides the ones
 // that depend on who loaded it.
 function runIsolated(source, ...args) {
-  const r = spawnSync(process.execPath, ["--expose-gc", "-e", source, ADDON_PATH, ...args], {
+  return runIsolatedIn(process.execPath, source, ...args);
+}
+
+// runIsolatedIn is runIsolated with a chosen Node.js executable.
+function runIsolatedIn(execPath, source, ...args) {
+  const r = spawnSync(execPath, ["--expose-gc", "-e", source, ADDON_PATH, ...args], {
     encoding: "utf8",
     timeout: 60_000,
   });
   const describe = () =>
+    (r.error ? `could not run: ${r.error.message}\n     ` : "") +
     `exit status ${r.status === null ? `signal ${r.signal}` : `0x${(r.status >>> 0).toString(16)}`}` +
-    `\n     stdout: ${r.stdout.trim()}\n     stderr: ${r.stderr.trim()}`;
+    `\n     stdout: ${(r.stdout ?? "").trim()}\n     stderr: ${(r.stderr ?? "").trim()}`;
   return { ...r, describe };
 }
 
@@ -661,6 +667,28 @@ check("threadsafe function (abort wakes every blocked caller)", () => {
     abort: "ok",
     blocked: ["napi_closing", "napi_closing", "napi_closing", "napi_closing"],
   }, r.describe());
+});
+
+check("host executable with another name (nothing is tied to \"node.exe\")", () => {
+  // The addon is loaded by a copy of this Node.js binary under a different
+  // file name — what Electron, a single-executable application or a renamed
+  // node look like to it. A Windows addon that imports its Node-API functions
+  // from "node.exe" cannot load there, or worse, loads a second Node.js found
+  // on PATH and calls into that.
+  const dir = mkdtempSync(join(tmpdir(), "napi-go-host-"));
+  try {
+    const host = join(dir, process.platform === "win32" ? "renamed-host.exe" : "renamed-host");
+    copyFileSync(process.execPath, host);
+    chmodSync(host, 0o755);
+    const r = runIsolatedIn(host, `
+      const addon = require(process.argv[1]);
+      console.log("LOADED", addon.add(1, 2), addon.hello("host"));
+    `);
+    assert.strictEqual(r.status, 0, r.describe());
+    assert.match(r.stdout, /LOADED 3 hello, host/, r.describe());
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // Let every promise settle, then report.

@@ -7,20 +7,20 @@
 ```
 JS (V8)                    C ABI (Node-API 8)                 Go
 ──────                     ──────────────────                 ──
-addon.node  ◄──load──►  node.exe (exports napi_*)  ◄──cgo──►  package napi
+addon.node  ◄──load──►  host process (exports napi_*)  ◄──cgo──►  package napi
    │                                                         │
    │  napi_register_module_v1 ◄───── //export ─────────────  package entry
    │  napiGoExecuteCallback  ◄───── //export ─────────────   callback trampoline
    └── value exchange: napi_value ↔ napi.Value(unsafe.Pointer)
 ```
 
-- **Stable C ABI only.** `NAPI_VERSION=8`, resolved entirely through `node.exe`
-  on Windows and through the host process's dynamic symbols on Linux/macOS.
-  Nothing links against V8 and nothing touches C++.
+- **Stable C ABI only.** `NAPI_VERSION=8`, resolved entirely against the
+  process that loads the addon: by the dynamic loader on Linux/macOS, by the
+  binding itself on Windows (see "How the Node-API functions are found on
+  Windows"). Nothing links against V8 or Node.js and nothing touches C++.
 - **Headers are vendored.** `include/node/` holds the official `node_api.h` /
-  `js_native_api.h` (MIT) and `windows/node.lib` is an import stub (symbol table
-  only, no code). The `#cgo` directives in `napi/cgo.go` wire everything up, so
-  users install no Node.js components at all.
+  `js_native_api.h` (MIT). The `#cgo` directives in `napi/cgo.go` wire them up,
+  so users install no Node.js components at all.
 
 ## How the cgo code is organised
 
@@ -236,14 +236,61 @@ a Go global is invisible to the other — and no copy is ever unloaded.
   `NAPI_MODULE` macro's version probe, which node uses to check ABI
   compatibility.
 
-## Why Windows links against node.lib and nothing else
+## How the Node-API functions are found on Windows
 
-- A PE DLL may not contain unresolved symbols, so Linux's
-  `--unresolved-symbols=ignore-all` route is not available on Windows.
-- `-lnode` locates `node.lib`, and both GNU ld and lld-link understand it — which
-  is why both MinGW gcc and clang can link the addon.
-- `node.lib` declares symbols only and pulls in no implementation; the artifact
-  binds to the host `node.exe` at run time.
+A PE DLL may not contain unresolved symbols, so Linux's
+`--unresolved-symbols=ignore-all` route is not available: every `napi_*`
+function the binding calls has to be defined at link time.
+
+The usual answer is the one this module used to take — link `node.lib`, the
+import library of `node.exe`. That writes the **file name** of the host into the
+addon's import table, and the Windows loader then looks for a module called
+`node.exe`. Measured, with a renamed copy of `node.exe` as the host:
+
+| Host | Result |
+| --- | --- |
+| `node.exe` | loads |
+| any other name, no `node.exe` on `PATH` | `ERR_DLOPEN_FAILED`: "The specified module could not be found" |
+| any other name, a `node.exe` on `PATH` | silent exit, `0xC0000028` |
+
+In the last row the import is satisfied by that other file — a second Node.js
+image, never initialised — instead of by the host. "Any other name" is not
+exotic: it is `electron.exe`, every single-executable application, and any
+embedder. node-gyp works around it with a delay-load hook
+that redirects `node.exe` to the running executable, which needs MSVC's
+delay-load support; GNU `ld` has no equivalent short of shipping
+toolchain-specific delay-import libraries.
+
+So the addon imports nothing from the host (`napi/host_windows.c`):
+
+- Every `napi_*` function is **defined in the addon** as a jump through a
+  function pointer. The list comes from the vendored headers at
+  `NAPI_VERSION 8` (`napi/host_symbols.h`, written by `go generate ./napi`).
+- When the addon is loaded, `napi_go_bind_host` fills the pointers in with
+  `GetProcAddress`, from the first of these that exports Node-API: the
+  executable itself (`node.exe`, `electron.exe`, a single-executable
+  application), then `libnode.dll` (Node.js built as a shared library; the
+  fallback node-gyp's hook uses too) and `node.dll`.
+- A function the host does not export keeps a stand-in that returns
+  `napi_generic_failure`, and the error carries an explanation, so an old host
+  fails with a message instead of a jump through a null pointer.
+
+The headers declare the functions `__declspec(dllexport)` on Windows, which
+would put all of them in the addon's own export table once it defines them;
+`napi_preamble.h` empties `NAPI_EXTERN` to prevent that. The cost of the scheme
+is one indirect jump per call, which does not show up next to the cgo
+transition (measured: the same per-call times before and after).
+
+Measured with a renamed copy of `node.exe`, which now loads the addon and runs
+it. Electron and single-executable applications export Node-API from their
+executable in the same way but have not been tried.
+
+What it changes for callers: C code of your own that calls `napi_*` functions
+directly needs no link flags on Windows — the functions are defined by package
+`napi`, in the same shared library (the `probe` package's raw probes work this
+way). But nothing is linked against the host any more, so code that used *other*
+symbols of `node.exe` through the bundled `node.lib` — libuv, V8 — has to bring
+its own import library.
 
 ## Known limitations
 
