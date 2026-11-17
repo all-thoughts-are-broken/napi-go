@@ -137,91 +137,186 @@ func (w *AsyncWork) Delete(env Env) error {
 // the JS function value in hand, so it can create arguments, call the
 // function, or even ignore it.
 //
-// Every Acquire must be matched by exactly one Release. When the last thread
-// releases, the function is done: further use is undefined in Node-API and
-// refused by this binding. Release(napi.Abort) ends it the same way — the
-// engine destroys the function on the next event-loop turn, so an aborted
-// handle is retired outright and nothing further is forwarded, not even the
-// Release of a thread that is still outstanding (see tsfnAbortedErr).
+// Every Acquire must be matched by exactly one Release. The function stops
+// being usable, and every method answers napi_closing from then on, when
+//
+//   - the last thread releases it;
+//   - any thread releases it with napi.Abort; or
+//   - its environment shuts down — the Worker that created it ends, or the
+//     process exits.
+//
+// The third happens without any call from Go. A goroutine looping over Call
+// learns of it from the error, and should stop; nothing it does with the handle
+// afterwards reaches the engine, including the Release it still "owes".
+//
+// The zero ThreadsafeFunction is not usable.
 type ThreadsafeFunction struct {
-	token unsafe.Pointer // identity token, never the engine pointer
+	// state is the handle's identity. It is a Go object, so it is unique by
+	// construction and cannot be mistaken for a recycled engine address; the
+	// engine pointer lives inside it and is only reachable while it is valid.
+	state *tsfnState
 }
 
-// tsfnState mirrors the engine's own (thread_count, state) pair, which the
-// binding has to keep because the engine never exposes it: node_api.cc's
-// ThreadSafeFunction has three states (kOpen, kClosing, kClosed) and moves
-// between them on the loop thread, after the call that caused the move has
-// already returned.
+// tsfnState is the binding's own record of one threadsafe function.
 //
-// Two facts make the mirror necessary rather than optional:
+// The object behind a napi_threadsafe_function is freed by the engine, on the
+// loop thread, at a moment no call from Go chooses — and every function that
+// takes the handle dereferences it unchecked. Two generations of the engine
+// disagree about when that moment is (node_api.cc, class ThreadSafeFunction):
 //
-//   - A normal Release leaves the engine in kOpen; only when the queue drains
-//     does the loop thread decide kClosing, then kClosed, then run
-//     ReleaseResources. Nothing observable from Go marks the transition.
-//   - Release in Abort mode moves to kClosing while thread_count is still
-//     positive, so "thread count above zero" does not mean "usable" — and the
-//     engine then destroys the function on its next turn regardless of the
-//     threads still outstanding.
+//   - Node.js 18, 20, 22 and 24 up to 24.13 delete the object as soon as it has
+//     been finalized, whatever its thread count says. Finalization follows the
+//     last release, an abort, or the environment shutting down, so a thread that
+//     still "holds" the function is left with a dangling pointer. Measured on
+//     22.22.2: a goroutine calling a function whose Worker had been terminated
+//     is 0xC0000005; a release one loop turn after an abort is 0xC0000028.
+//   - Node.js 24.14 and later keep the finalized object until every thread has
+//     released it, and the release that takes the count to zero deletes it.
+//     There the use-after-free is one call too many.
 //
-// Counting threads without the abort flag was a real hole. After
-// Release(Abort) on a two-thread function the count reads 1, so a stray Call
-// was still forwarded; the engine's Push, on a function that is no longer open,
-// does not merely refuse — it counts the last thread away and deletes the
-// object. The Release that follows then locks the mutex of freed memory.
-// Measured: 0xC0000028 (STATUS_ASSERTION_FAILURE, a deleted CRITICAL_SECTION)
-// with no output at all.
+// What both agree on is the finalize callback: it runs on the loop thread while
+// the object is still allocated, before either kind of deletion. The state is
+// built around that one point.
+//
+//   - alive guards the engine pointer. Every call into the engine holds it for
+//     reading; the finalizer takes it for writing, so it waits out the calls
+//     already inside the engine, and none can start afterwards.
+//   - Inside the finalizer, with the object certainly alive, the binding hands
+//     back every thread count Go still holds. The newer engine can then delete
+//     the object straight away instead of waiting for releases that will never
+//     be forwarded; to the older one it makes no difference.
+//   - From then on the pointer is dead to this package: engine is nil and every
+//     method answers napi_closing.
+//
+// Holding alive across an engine call is only sound if the call cannot block.
+// That is one of the two reasons Call never asks the engine to block; see Call.
 type tsfnState struct {
-	mu      sync.Mutex
-	engine  unsafe.Pointer
+	alive  sync.RWMutex
+	engine unsafe.Pointer // guarded by alive; nil once finalized
+
+	mu   sync.Mutex
+	cond *sync.Cond // on mu: a payload was dispatched, or the state changed
+
+	// threads is how many thread counts are held through this package. It
+	// tracks the engine's own count: every engine call that changes one changes
+	// the other.
 	threads int
-	aborted bool // Release(Abort) ran: the engine will destroy the function
+	// aborted records that Release(Abort) ran.
+	aborted bool
+	// closing records that the engine is tearing the function down: it
+	// answered napi_closing, or its finalizer has run.
+	closing bool
+	// dispatched counts the payloads the engine has taken off the queue. A
+	// blocked Call watches it to know when there may be room again.
+	dispatched uint64
 }
 
-// tsfnTable maps a live threadsafe function token to its state; the engine
-// pointer lives inside the state, so it is reachable only through a live token.
-var tsfnTable sync.Map // unsafe.Pointer(token) -> *tsfnState
-
-func (f ThreadsafeFunction) state() *tsfnState {
-	if f.token == nil {
-		return nil
-	}
-	if v, ok := tsfnTable.Load(f.token); ok {
-		return v.(*tsfnState)
-	}
-	return nil
+func newTSFNState(threads int) *tsfnState {
+	st := &tsfnState{threads: threads}
+	st.cond = sync.NewCond(&st.mu)
+	return st
 }
 
-// engine returns the raw pointer to hand the engine. Only call it on a state
-// obtained from live() or state().
+// raw returns the pointer to hand the engine. alive must be held.
 func (st *tsfnState) raw() C.napi_threadsafe_function {
 	return C.napi_threadsafe_function(st.engine)
 }
 
-// live returns the state when the function can still be used, and an error
-// saying why it cannot otherwise: a token this package never issued, every
-// thread already released, or an abort that has left the engine's object
-// unusable.
-func (f ThreadsafeFunction) live(op string) (*tsfnState, error) {
-	st := f.state()
-	if st == nil {
-		return nil, tsfnNotLiveErr(op)
+// unusableLocked returns why the function cannot be used, or nil when it can.
+// mu must be held.
+func (st *tsfnState) unusableLocked(op string) error {
+	switch {
+	case st.aborted:
+		return tsfnAbortedErr(op)
+	case st.closing:
+		return tsfnClosingErr(op)
+	case st.threads <= 0:
+		return tsfnNotLiveErr(op)
 	}
+	return nil
+}
+
+// enter begins a call into the engine. On success it returns with alive held
+// for reading — the engine object cannot be finalized until the caller unlocks
+// it — and the caller must call st.alive.RUnlock.
+func (st *tsfnState) enter(op string) error {
+	st.alive.RLock()
 	st.mu.Lock()
-	defer st.mu.Unlock()
-	if st.aborted {
-		return nil, tsfnAbortedErr(op)
+	err := st.unusableLocked(op)
+	st.mu.Unlock()
+	if err != nil {
+		st.alive.RUnlock()
 	}
-	if st.threads <= 0 {
-		return nil, tsfnNotLiveErr(op)
+	return err
+}
+
+// markClosing records that the engine answered napi_closing. consumed says
+// whether the engine also took the calling thread's count, which
+// napi_call_threadsafe_function does and napi_acquire_threadsafe_function does
+// not.
+func (st *tsfnState) markClosing(consumed bool) {
+	st.mu.Lock()
+	st.closing = true
+	if consumed && st.threads > 0 {
+		st.threads--
 	}
-	return st, nil
+	st.cond.Broadcast()
+	st.mu.Unlock()
+}
+
+// noteDispatch records that the engine took one payload off the queue, which
+// is the moment a slot becomes free. It runs on the loop thread.
+func (st *tsfnState) noteDispatch() {
+	st.mu.Lock()
+	st.dispatched++
+	st.cond.Signal() // one slot, one waiter
+	st.mu.Unlock()
+}
+
+// finalize is the engine's notice that the function is about to go away. It
+// runs on the loop thread, from the finalize callback, while the engine object
+// is still allocated.
+func (st *tsfnState) finalize() {
+	// Turn away new calls and wake every Call waiting for room.
+	st.mu.Lock()
+	st.closing = true
+	st.cond.Broadcast()
+	st.mu.Unlock()
+
+	// Wait for the calls already inside the engine. They cannot block there,
+	// so this is bounded by the engine's own short critical sections.
+	st.alive.Lock()
+	defer st.alive.Unlock()
+
+	// Hand back what Go still holds. See the type comment: this is what lets
+	// an engine that waits for every thread delete the object now.
+	st.mu.Lock()
+	held := st.threads
+	st.threads = 0
+	st.mu.Unlock()
+	for ; held > 0; held-- {
+		if C.napi_release_threadsafe_function(st.raw(), C.napi_tsfn_release) != C.napi_ok {
+			break
+		}
+	}
+	st.engine = nil
 }
 
 func tsfnNotLiveErr(op string) error {
 	return &StatusError{
 		Code: StatusClosing,
 		Message: "threadsafe function is not live (" + op + "): every acquired thread has been " +
-			"released or aborted already, or the handle did not come from NewThreadsafeFunction",
+			"released already, or the handle did not come from NewThreadsafeFunction",
+	}
+}
+
+// tsfnClosingErr reports a function the engine has started to tear down
+// without being asked to by this handle: its environment is shutting down.
+func tsfnClosingErr(op string) error {
+	return &StatusError{
+		Code: StatusClosing,
+		Message: "threadsafe function is closing (" + op + "): its environment is shutting down or " +
+			"has shut down, so no further call on this handle is safe",
 	}
 }
 
@@ -229,20 +324,20 @@ func tsfnNotLiveErr(op string) error {
 //
 // Abort is not a state the caller can work through. Node-API documents the
 // function as staying alive until every thread has released, and
-// napi_release_threadsafe_function in Release mode as the way to get there —
-// but the engine destroys the function on the next event-loop turn regardless
-// of how many threads are still outstanding, so the release that is supposed to
-// finish the job faults instead. Measured with raw Node-API on this machine, no
-// binding code involved, initial thread counts 1, 2 and 3, bounded and unbounded
-// queues:
+// napi_release_threadsafe_function in Release mode as the way to get there. On
+// the engines that delete the object at finalization (see tsfnState) that
+// release is the fault itself. Measured with raw Node-API on Node.js 22.22.2,
+// no binding code involved, initial thread counts 1, 2 and 3, bounded and
+// unbounded queues:
 //
 //	create + abort + release                    -> all napi_ok
 //	create + abort, one loop turn, then acquire -> 0xC0000028
 //	create + abort, one loop turn, then release -> 0xC0000028
 //
 // 0xC0000028 is STATUS_ASSERTION_FAILURE, which is what Windows raises when a
-// deleted CRITICAL_SECTION is entered — the engine's mutex is gone. There is
-// nothing left to forward, so the whole handle is retired here.
+// deleted CRITICAL_SECTION is entered — the engine's mutex is gone. So the
+// whole handle is retired at the abort, and the counts the other threads still
+// hold are handed back by the finalizer, where it is safe on every engine.
 func tsfnAbortedErr(op string) error {
 	return &StatusError{
 		Code: StatusClosing,
@@ -266,60 +361,138 @@ func NewThreadsafeFunction(env Env, jsFunc Value, maxQueueSize, initialThreadCou
 		return ThreadsafeFunction{}, err
 	}
 
+	st := newTSFNState(initialThreadCount)
+
+	// The finalize callback is how the binding learns that the engine object
+	// is going away; its data is a box holding the state, released by
+	// napiGoTSFNFinalize.
+	finalizeBox := boxHandle(st)
+
 	var result C.napi_threadsafe_function
-	st := C.napi_create_threadsafe_function(
+	code := C.napi_create_threadsafe_function(
 		C.napi_env(env), C.napi_value(jsFunc),
 		nil, C.napi_value(resourceName),
 		C.size_t(maxQueueSize), C.size_t(initialThreadCount),
-		nil, nil, // thread finalize
+		finalizeBox, C.napi_finalize(C.napiGoTSFNFinalize), // thread finalize
 		nil, // context
 		C.napi_threadsafe_function_call_js(C.napiGoTSFNCallJs),
 		&result,
 	)
-	if st != C.napi_ok {
-		return ThreadsafeFunction{}, errOf(env, Status(st))
+	if code != C.napi_ok {
+		// No function was created, so the finalizer will never run.
+		freeBox(finalizeBox)
+		return ThreadsafeFunction{}, errOf(env, Status(code))
 	}
-	f := ThreadsafeFunction{token: unsafe.Pointer(new(handleToken))}
-	tsfnTable.Store(f.token, &tsfnState{engine: unsafe.Pointer(result), threads: initialThreadCount})
-	return f, nil
+	st.engine = unsafe.Pointer(result)
+	return ThreadsafeFunction{state: st}, nil
 }
 
 // TSFNCallFunc is the payload of one dispatch: it runs on the JS thread with
 // the wrapped JS function (nil if the function was released mid-flight).
 type TSFNCallFunc func(env Env, jsFunc Value)
 
-// Call schedules fn to run on the JS thread. Safe from any goroutine. The
-// blocking variants block the calling goroutine while the queue is full.
+// Call schedules fn to run on the JS thread. Safe from any goroutine. With
+// napi.Blocking it waits while the queue is full; with napi.NonBlocking it
+// returns napi_queue_full instead.
 //
-// Calling after the last Release, or at all after an Abort, returns napi_closing
-// instead of reaching the engine. Forwarding such a call is not harmless: see
-// tsfnAbortedErr.
+// Calling after the last Release, after an Abort, or once the environment has
+// begun to shut down returns napi_closing instead of reaching the engine. When
+// that error comes back, stop using the handle: there is nothing left to
+// release.
+//
+// The waiting is done here, not in the engine — the engine is only ever asked
+// to queue without blocking, and a full queue is retried when a payload has
+// been dispatched. Two properties of the engine's own blocking make it
+// unusable:
+//
+//   - It wakes one waiter when the function closes, not all of them. Measured:
+//     four goroutines blocked behind a full queue of one, then an abort — one
+//     came back with napi_closing and three stayed blocked for good, on an
+//     object the engine went on to delete.
+//   - A thread blocked inside the engine cannot be waited out, so the finalizer
+//     could not make sure nobody is still in there (see tsfnState).
 func (f ThreadsafeFunction) Call(fn TSFNCallFunc, mode ThreadsafeFunctionCallMode) error {
-	st, err := f.live("call")
+	st := f.state
+	if st == nil {
+		return tsfnNotLiveErr("call")
+	}
+	st.mu.Lock()
+	err := st.unusableLocked("call")
+	st.mu.Unlock()
 	if err != nil {
 		return err
 	}
-	box := boxHandle(&tsfnCall{fn: fn})
-	code := C.napi_call_threadsafe_function(
-		st.raw(), box,
-		C.napi_threadsafe_function_call_mode(mode),
-	)
-	if code != C.napi_ok {
-		// The call was not queued (closing / queue full); nobody else will
-		// free the box for us.
-		freeBox(box)
-		return &StatusError{Code: Status(code)}
+
+	box := boxHandle(&tsfnCall{fn: fn, owner: st})
+	for {
+		code, seen, err := st.push(box)
+		if err != nil {
+			freeBox(box)
+			return err
+		}
+		switch {
+		case code == C.napi_ok:
+			return nil // the box now belongs to the queue
+		case code == C.napi_queue_full && mode != NonBlocking:
+			st.awaitRoom(seen)
+		case code == C.napi_closing:
+			freeBox(box)
+			return tsfnClosingErr("call")
+		default:
+			// Not queued (the queue is full, or the engine refused); nobody
+			// else will free the box.
+			freeBox(box)
+			return &StatusError{Code: Status(code)}
+		}
 	}
-	return nil
+}
+
+// push offers one payload to the engine without blocking. seen is the dispatch
+// count read before the attempt: if the queue turns out to be full, any
+// dispatch after that reading may have made room, so the caller waits for the
+// count to move past it and cannot miss a wake-up.
+func (st *tsfnState) push(box unsafe.Pointer) (code C.napi_status, seen uint64, err error) {
+	st.alive.RLock()
+	defer st.alive.RUnlock()
+
+	st.mu.Lock()
+	err = st.unusableLocked("call")
+	seen = st.dispatched
+	st.mu.Unlock()
+	if err != nil {
+		return 0, 0, err
+	}
+
+	code = C.napi_call_threadsafe_function(st.raw(), box, C.napi_tsfn_nonblocking)
+	if code == C.napi_closing {
+		// The engine took this thread's count along with the refusal.
+		st.markClosing(true)
+	}
+	return code, seen, nil
+}
+
+// awaitRoom blocks until a payload has been dispatched since seen, or the
+// function stops being usable.
+func (st *tsfnState) awaitRoom(seen uint64) {
+	st.mu.Lock()
+	for st.dispatched == seen && !st.aborted && !st.closing && st.threads > 0 {
+		st.cond.Wait()
+	}
+	st.mu.Unlock()
 }
 
 // GetContext returns the context pointer passed at creation time (nil in
 // this binding; provided for API completeness).
 func (f ThreadsafeFunction) GetContext() (unsafe.Pointer, error) {
-	st, err := f.live("get context")
-	if err != nil {
+	st := f.state
+	if st == nil {
+		return nil, tsfnNotLiveErr("get context")
+	}
+	if err := st.enter("get context"); err != nil {
 		return nil, err
 	}
+	defer st.alive.RUnlock()
+
 	var ctx unsafe.Pointer
 	code := C.napi_get_threadsafe_function_context(st.raw(), &ctx)
 	return ctx, errOf(nil, Status(code))
@@ -332,72 +505,77 @@ func (f ThreadsafeFunction) GetContext() (unsafe.Pointer, error) {
 // would allow the first and faults on the second, and a revived thread count is
 // what keeps the process from ever exiting.
 func (f ThreadsafeFunction) Acquire() error {
-	st, err := f.live("acquire")
-	if err != nil {
+	st := f.state
+	if st == nil {
+		return tsfnNotLiveErr("acquire")
+	}
+	if err := st.enter("acquire"); err != nil {
 		return err
 	}
-	if code := C.napi_acquire_threadsafe_function(st.raw()); code != C.napi_ok {
+	defer st.alive.RUnlock()
+
+	switch code := C.napi_acquire_threadsafe_function(st.raw()); code {
+	case C.napi_ok:
+		st.mu.Lock()
+		st.threads++
+		st.mu.Unlock()
+		return nil
+	case C.napi_closing:
+		st.markClosing(false)
+		return tsfnClosingErr("acquire")
+	default:
 		return errOf(nil, Status(code))
 	}
-	st.mu.Lock()
-	st.threads++
-	st.mu.Unlock()
-	return nil
 }
 
 // Release drops one acquired thread. With mode Release the function closes once
-// the count reaches zero; Abort closes it immediately, dropping queued calls
-// (note: dropped payloads are never dispatched and their closures are garbage
-// collected with the cgo handle when the process exits).
+// the count reaches zero and the queue has drained; Abort closes it at once.
+// Payloads still queued when it closes are never dispatched: the engine hands
+// each one back without an environment and the binding discards it.
 //
 // Every Acquire must be matched by exactly one Release, and an unmatched extra
 // Release is reported rather than forwarded — that one really is a mistake, and
 // it is what leaves the environment pinned so the process cannot exit.
 //
-// Release is refused once the function has been aborted, including the release
-// of a thread that is still outstanding. Node-API's documentation says that
-// release is how an aborted function is finished off, but the engine destroys
-// the function on the next event-loop turn instead, so the call faults; see
-// tsfnAbortedErr. Nothing about the abort trap can be repaired from here, so
-// the caller is told rather than allowed to crash.
+// Release is refused once the function has been aborted or its environment has
+// begun to shut down, including the release of a thread that is still
+// outstanding. Node-API's documentation says that release is how such a
+// function is finished off, but on the engines that delete the object at
+// finalization the call faults; see tsfnAbortedErr. The binding returns those
+// outstanding counts itself, from the finalizer, so the caller has nothing
+// left to do and is told so.
 func (f ThreadsafeFunction) Release(mode ThreadsafeFunctionReleaseMode) error {
-	st := f.state()
+	st := f.state
 	if st == nil {
 		return tsfnNotLiveErr("release")
 	}
+	st.alive.RLock()
+	defer st.alive.RUnlock()
+
 	st.mu.Lock()
-	if st.aborted {
+	if err := st.unusableLocked("release"); err != nil {
 		st.mu.Unlock()
-		return tsfnAbortedErr("release")
-	}
-	if st.threads <= 0 {
-		st.mu.Unlock()
-		return &StatusError{
-			Code:    StatusInvalidArg,
-			Message: "threadsafe function has no acquired thread left to release",
-		}
+		return err
 	}
 	st.threads--
 	if mode == Abort {
-		// The engine moves to kClosing without touching thread_count and never
-		// moves back; the loop then tears the function down on its next turn.
+		// The engine starts closing without waiting for the other threads and
+		// never goes back.
 		st.aborted = true
 	}
-	last := st.threads == 0
+	st.cond.Broadcast() // a waiting Call has to look again
 	st.mu.Unlock()
 
 	code := C.napi_release_threadsafe_function(st.raw(), C.napi_threadsafe_function_release_mode(mode))
 	if code != C.napi_ok {
+		// The engine refused; keep the two records in step.
 		st.mu.Lock()
-		st.threads++ // the engine refused; keep the two counts in step
+		st.threads++
+		if mode == Abort {
+			st.aborted = false
+		}
 		st.mu.Unlock()
 		return errOf(nil, Status(code))
-	}
-	if last {
-		// The engine finishes tearing the function down on the loop thread;
-		// forgetting the token here is what makes every later call report "not
-		// live" instead of reviving it.
-		tsfnTable.Delete(f.token)
 	}
 	return nil
 }
@@ -405,20 +583,30 @@ func (f ThreadsafeFunction) Release(mode ThreadsafeFunctionReleaseMode) error {
 // Unref detaches the function from the event loop so it does not keep the
 // process alive by itself.
 func (f ThreadsafeFunction) Unref(env Env) error {
-	st, err := f.live("unref")
-	if err != nil {
+	st := f.state
+	if st == nil {
+		return tsfnNotLiveErr("unref")
+	}
+	if err := st.enter("unref"); err != nil {
 		return err
 	}
+	defer st.alive.RUnlock()
+
 	code := C.napi_unref_threadsafe_function(C.napi_env(env), st.raw())
 	return errOf(env, Status(code))
 }
 
 // Ref re-attaches the function to the event loop.
 func (f ThreadsafeFunction) Ref(env Env) error {
-	st, err := f.live("ref")
-	if err != nil {
+	st := f.state
+	if st == nil {
+		return tsfnNotLiveErr("ref")
+	}
+	if err := st.enter("ref"); err != nil {
 		return err
 	}
+	defer st.alive.RUnlock()
+
 	code := C.napi_ref_threadsafe_function(C.napi_env(env), st.raw())
 	return errOf(env, Status(code))
 }

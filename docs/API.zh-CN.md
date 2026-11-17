@@ -128,11 +128,16 @@ tsfn.Acquire() / Release(mode) / Ref(env) / Unref(env)
 - `Release` 会让引用计数归零并关闭函数；**注意在队列排空后再 Release**
   （队列未空时关闭，积压 payload 会被 node 以 NULL env 丢弃——绑定会安全释放
   它们，但你的闭包不会执行）。
-- **`Release(napi.Abort)` 之后这个句柄就作废了**：引擎会在下一轮事件循环里
-  销毁对象，此后任何调用都踩已释放内存（实测 `0xC0000028` 无声退出）。绑定因此
-  在 abort 之后把所有操作——**包括剩余线程的 `Release`**——都拦成
-  `napi_closing`。多线程场景请在最后一刻才 abort，或者干脆只用 `Release`
-  模式让它自然收尾。
+- **函数在三种情况下结束**：最后一个线程 Release、任一线程以 `napi.Abort`
+  Release、或它所在的环境关闭（创建它的 Worker 结束）。此后所有方法都返回
+  `napi_closing`，什么都不再转发给引擎——**包括剩余线程的 `Release`**，在
+  Node.js 24.13 及以前它踩的是已释放内存（实测：abort 之后 `0xC0000028` 无声
+  退出；goroutine 调用已终止 Worker 的函数是 `0xC0000005`）。从 `Call` 拿到
+  `napi_closing` 的 goroutine 应当停止；它的线程计数绑定已经替它归还了。多线程
+  场景请在最后一刻才 abort，或者干脆只用 `Release` 模式让它自然收尾。
+- `napi.Blocking` 是在 Go 里等待，而不是在引擎里：调用以非阻塞方式入队，队满时
+  等下一次派发后重试。函数结束时所有被阻塞的调用者都会被唤醒；引擎自己的阻塞
+  只会唤醒其中一个。
 - 闭包持有 `napi.Value` 跨回调是非法的；需要保留 JS 值时在闭包里用
   `napi.CreateReference`。
 - **闭包里调用 JS、而那段 JS 抛异常时**，`CallFunction` 返回

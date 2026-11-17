@@ -44,6 +44,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the debug box counter now shows one box per function instead of one per
   descriptor plus one per call. `DefineClass` is unaffected: its boxes are tied
   to the class, which the engine never collects.
+- **A goroutine that used a threadsafe function after its environment had shut
+  down crashed the process.** When a Worker ends, the engine tears down the
+  threadsafe functions it created. The binding registered no finalize callback,
+  so it was never told: its own record still said "live", and the goroutine's
+  next `Call` reached a freed object. Measured on Node.js 22: `0xC0000005`, every
+  time.
+
+  The binding now registers the finalize callback and builds the function's
+  lifetime on it. That callback is the one point at which the engine object is
+  known to be valid for the last time on every Node.js release — Node.js up to
+  24.13 deletes the object right after it, 24.14 and later keep it until every
+  thread has released (`docs/DESIGN.md`, "Known limitations", has the two side
+  by side). Calls into the engine hold a read lock that the finalizer takes for
+  writing; the finalizer hands back the thread counts Go still holds; afterwards
+  every method returns `napi_closing` and nothing is forwarded. A goroutine
+  looping over `Call` sees that error and stops, and the `Release` it would have
+  made is refused instead of faulting.
+
+  Measured on Node.js 22. On the engine that Node.js 24.14 and later ship, the
+  same code path is derived from the engine's source and has not been run
+  locally; CI's Node.js 24 leg runs the checks against it.
+- **An abort left all but one of the goroutines blocked in `Call` blocked for
+  good.** With several callers waiting behind a full queue, the engine wakes one
+  of them when the function closes — `Signal`, where it has to wake them all —
+  and goes on to delete the object the others are waiting on. Measured: four
+  blocked callers, one returned `napi_closing`, three never returned.
+  `Call(..., napi.Blocking)` now waits in Go: the engine is only ever asked to
+  queue without blocking, and a full queue is retried after the next dispatch.
+  Every blocked caller is woken when the function ends.
 
 ### Documented
 

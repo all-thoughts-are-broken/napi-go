@@ -157,7 +157,9 @@ JS 调用 f(x)
   会被拒绝，而不是被重新解释。
 
 这也是为什么 `AsyncWork` 从一开始就是正确的形态——它是 Go 结构体指针，
-天然唯一；令牌只是把同样的事实带给那几种由引擎分配的对象。
+天然唯一；`ThreadsafeFunction` 持有的也是指向 Go 侧状态的指针而不是令牌：那份
+状态本来就必须存在，而且同样唯一。令牌只是把同样的事实带给那几种由引擎分配的
+对象。
 
 ## worker_threads（多环境）
 
@@ -209,25 +211,49 @@ Go runtime 无法关停：调度器、GC、sysmon 线程还在运行，此时跑
 
 ## 已知限制
 
-- **`napi_release_threadsafe_function(..., napi_tsfn_abort)` 之后的事件循环
-  转身会销毁对象，文档所述的线程计数语义不成立。** 实测（纯 Node-API，
-  `probe/bridge.go` 的原始探针，Node.js 22 / Windows）：
+- **引擎按自己的节奏释放线程安全函数，而且两代引擎对“什么时候”说法不一。**
+  所有接收这个句柄的函数都不加检查地解引用它，所以“什么时候”决定了什么是
+  use-after-free（`node_api.cc`，`ThreadSafeFunction` 类）：
+
+  | 引擎 | 对象何时被释放 | use-after-free 是什么 |
+  | --- | --- | --- |
+  | Node.js 18、20、22，以及 24.13 及以前的 24 | 一旦 finalize 完就释放，不管线程计数是多少 | finalize 之后的任何调用，包括线程还“欠着”的那次 release |
+  | Node.js 24.14 及以后 | finalize 完**并且**所有线程都 release 之后 | 比线程持有数多出来的那一次调用 |
+
+  finalize 发生在最后一次 release、abort **或环境关闭**之后——最后一种情况下
+  addon 根本没有发起任何调用。在 Node.js 22.22.2 / Windows 上实测：
 
   | 序列 | 结果 |
   | --- | --- |
-  | `create(2) + abort + release`（同一轮，不转事件循环） | 全部 `napi_ok` |
-  | `create(2) + abort` → 转一圈 → `acquire` | `0xC0000028` |
-  | `create(2) + abort` → 转一圈 → `release` | `0xC0000028` |
+  | goroutine 调用一个 Worker 已被终止的函数 | `0xC0000005` |
+  | 纯 Node-API：`create(2) + abort + release`（同一轮，不转事件循环） | 全部 `napi_ok` |
+  | 纯 Node-API：`create(2) + abort` → 转一圈 → `acquire` | `0xC0000028` |
+  | 纯 Node-API：`create(2) + abort` → 转一圈 → `release` | `0xC0000028` |
+  | 四个线程阻塞在容量为 1 的满队列后面，然后 abort | 一个返回 `napi_closing`，三个永久阻塞 |
 
-  线程数 1/2/3、队列有界/无界表现一致；只有「不转事件循环」才正常。
-  `0xC0000028` 是 `STATUS_ASSERTION_FAILURE`，在 Windows 上是进入
-  **已删除的 CRITICAL_SECTION** 的典型症状，即引擎的 mutex 已随对象消失。
-  Node-API 文档说 abort 后对象「等所有线程 release 才销毁」，实现并非如此。
+  `0xC0000028` 是 `STATUS_ASSERTION_FAILURE`，在 Windows 上是进入**已删除的
+  CRITICAL_SECTION** 的典型症状，即引擎的 mutex 已随对象消失。线程数 1/2/3、
+  队列有界/无界表现一致。最后一行是引擎只唤醒了一个等待者（`Signal`），而它
+  本该唤醒全部。
 
-  绑定侧的处置：abort 之后**一切都返回 `napi_closing`、什么都不转发**，
-  包括文档推荐用来收尾的那个「剩余线程 Release」。这不会钉住环境——
-  引擎在销毁前已经跑过 `ReleaseResources`（`env->Unref()` + 摘 cleanup hook），
-  所以进程照常退出。代价是那个引擎对象本身泄漏（无法安全回收）。
+  两代引擎唯一一致的地方是 finalize 回调：它在 loop 线程上运行，此时对象还
+  没被释放。绑定的处理（`napi/async.go` 里的 `tsfnState`）就建立在这一个点上：
+
+  - 每次进入引擎的调用都持有读锁；finalizer 拿写锁，于是它会等已经在引擎里的
+    调用返回，此后也不会再有新的调用进去。
+  - 在 finalizer 里，绑定把 Go 还持有的线程计数全部归还。新引擎因此可以立刻
+    删除对象，而不必等那些永远不会被转发的 release；对旧引擎没有任何影响。
+    两边都不泄漏。
+  - 此后**一切都返回 `napi_closing`、什么都不转发**。abort 之后同样如此，包括
+    Node-API 文档推荐用来收尾的那个「剩余线程 Release」——在旧引擎上，出错的
+    正是这次 release。
+  - 绑定从不让引擎阻塞。`Call(..., napi.Blocking)` 以非阻塞方式入队，队满时在
+    Go 里等待下一次派发。正因如此才有可能等待在途的调用，函数结束时也能唤醒
+    每一个被阻塞的调用者。
+
+  剩下的限制：持有 `ThreadsafeFunction` 的代码要到下一次调用返回 `napi_closing`
+  时才知道环境已经没了。以上都是在 Node.js 22（旧引擎）上实测的。新引擎的路径
+  是从它的源码推出来的；CI 会在自带新引擎的 Node.js 24 上运行同样的检查。
 
 - Node-API 9/10 的 API（external string、property key、syntax error、
   module file name 等）刻意未绑定：会引入新符号依赖，破坏"一次编译、全版本

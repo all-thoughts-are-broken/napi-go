@@ -160,9 +160,11 @@ func Greet(env napi.Env, info napi.CallbackInfo) napi.Value {
 }
 ```
 
-> `Release(napi.Abort)` 之后这个句柄就作废了：引擎会在下一轮事件循环里销毁对象，
-> 此后任何调用——**包括剩余线程的 `Release`**——都会踩已释放内存。绑定因此把
-> abort 之后的全部操作拦成 `napi_closing`。能用普通 `Release` 就尽量别 abort。
+> 线程安全函数在三种情况下结束：最后一个线程 Release、被 abort、或它所在的环境
+> 关闭（创建它的 Worker 结束）。此后所有方法都返回 `napi_closing`，什么都不会再
+> 转发给引擎。循环调用 `Call` 的 goroutine 应当把这个错误当作停止的信号，之后
+> 也不再欠一次 `Release`。`Release(napi.Abort)` 会让函数对所有线程同时结束，包括
+> 还没 Release 的线程——能用普通 `Release` 就尽量别 abort。
 
 ### Promise 与 async work（libuv 线程池）
 

@@ -169,10 +169,13 @@ func Greet(env napi.Env, info napi.CallbackInfo) napi.Value {
 }
 ```
 
-> `Release(napi.Abort)` invalidates the handle: the engine destroys the object on
-> the next event-loop turn, so every later call — including the remaining
-> threads' `Release` — would touch freed memory. The binding rejects all of
-> them with `napi_closing`. Prefer plain `Release` when you can.
+> A threadsafe function ends when its last thread releases it, when it is
+> aborted, or when its environment shuts down (the Worker that created it
+> ends). From then on every method returns `napi_closing` and nothing reaches
+> the engine. A goroutine looping over `Call` should take that error as its cue
+> to stop; it owes no `Release` afterwards. `Release(napi.Abort)` ends the
+> function for every thread at once, including the ones that have not released
+> yet — prefer plain `Release` when you can.
 
 ### Promises with async work (libuv thread pool)
 

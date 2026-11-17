@@ -612,6 +612,57 @@ check("DefineProperties (methods and accessors outlive the object they were defi
   assert.match(r.stdout, /SIZE 1\r?\n/, r.describe());
 });
 
+check("threadsafe function (a goroutine keeps calling after its environment is gone)", () => {
+  // A Worker starts a goroutine that loops over a threadsafe function, and is
+  // then terminated. The engine tears the function down with the environment;
+  // the goroutine knows nothing about that and calls again. It has to be told
+  // (napi_closing), and its release and any later call have to be refused
+  // rather than reach the engine's freed object.
+  const r = runIsolated(`
+    const { Worker } = require("node:worker_threads");
+    const addon = require(process.argv[1]);
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const w = new Worker(
+      "const { workerData, parentPort } = require('node:worker_threads');" +
+      "require(workerData).tsfnTicker(() => {});" +
+      "parentPort.postMessage('started');" +
+      "setInterval(() => {}, 1000);",
+      { eval: true, workerData: process.argv[1] });
+    w.on("message", async () => {
+      await sleep(100);
+      await w.terminate();
+      for (let i = 0; i < 100 && !addon.tsfnTickerReport().done; i++) await sleep(20);
+      console.log("REPORT", JSON.stringify(addon.tsfnTickerReport()));
+    });
+  `);
+  assert.strictEqual(r.status, 0, r.describe());
+  const report = JSON.parse(/REPORT (.*)/.exec(r.stdout)?.[1] ?? "null");
+  assert.deepStrictEqual(report, {
+    done: true,
+    dispatchedSome: true,
+    callErr: "napi_closing",
+    releaseErr: "napi_closing",
+    lateErr: "napi_closing",
+  }, r.describe());
+});
+
+check("threadsafe function (abort wakes every blocked caller)", () => {
+  // Four goroutines wait behind a full queue of one; the function is aborted.
+  // Each of them has to come back with napi_closing.
+  const r = runIsolated(`
+    const addon = require(process.argv[1]);
+    console.log("RESULT", JSON.stringify(addon.tsfnAbortBlocked(() => {}, 4)));
+  `);
+  assert.strictEqual(r.status, 0, r.describe());
+  const result = JSON.parse(/RESULT (.*)/.exec(r.stdout)?.[1] ?? "null");
+  assert.deepStrictEqual(result, {
+    first: "ok",
+    second: "napi_queue_full",
+    abort: "ok",
+    blocked: ["napi_closing", "napi_closing", "napi_closing", "napi_closing"],
+  }, r.describe());
+});
+
 // Let every promise settle, then report.
 Promise.allSettled(pending).then(() => {
   if (process.exitCode) {

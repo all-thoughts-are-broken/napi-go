@@ -34,6 +34,7 @@ extern void napiGoAsyncCleanupHook(napi_async_cleanup_hook_handle handle, void* 
 extern void napiGoAsyncExecute(napi_env env, void* data);
 extern void napiGoAsyncComplete(napi_env env, napi_status status, void* data);
 extern void napiGoTSFNCallJs(napi_env env, napi_value js_callback, void* context, void* data);
+extern void napiGoTSFNFinalize(napi_env env, void* finalize_data, void* finalize_hint);
 
 // ---- cgo handle boxing ----------------------------------------------------
 // cgo.Handle values (uintptr) are stored in C-allocated boxes so they can be

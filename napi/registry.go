@@ -355,9 +355,12 @@ func napiGoAsyncComplete(cEnv C.napi_env, cStatus C.napi_status, cData unsafe.Po
 	}
 }
 
-// tsfnCall carries the payload of one threadsafe-function dispatch.
+// tsfnCall carries the payload of one threadsafe-function dispatch. owner is
+// the function it was queued on, which is told when the engine takes the
+// payload off the queue.
 type tsfnCall struct {
-	fn func(Env, Value)
+	fn    func(Env, Value)
+	owner *tsfnState
 }
 
 // napiGoTSFNCallJs runs on the JS thread for every queued TSFN call. The
@@ -390,6 +393,11 @@ func napiGoTSFNCallJs(cEnv C.napi_env, cJsCallback C.napi_value, cContext, cData
 	}()
 
 	call, ok := loadBox(cData).(*tsfnCall)
+	if ok && call.owner != nil {
+		// The payload has left the queue, whether to run or to be dropped:
+		// a Call waiting for room can try again.
+		call.owner.noteDispatch()
+	}
 	if !ok || cEnv == nil {
 		// Environment is gone; nothing can be dispatched. The closure is
 		// garbage collected along with the freed box.
@@ -407,4 +415,32 @@ func napiGoTSFNCallJs(cEnv C.napi_env, cJsCallback C.napi_value, cContext, cData
 		defer recoverToJS(env)
 		fn(env, Value(cJsCallback))
 	}()
+}
+
+// napiGoTSFNFinalize is the thread_finalize_cb of every threadsafe function.
+// The engine calls it on the loop thread when the function is being torn down
+// — after the last release, after an abort, or because the environment is
+// shutting down — and always before the engine object is freed. It is the only
+// notice the binding gets, and the only moment at which the engine pointer is
+// known to be valid for the last time; tsfnState.finalize does the work.
+//
+// cData is a box holding the *tsfnState, created by NewThreadsafeFunction.
+//
+//export napiGoTSFNFinalize
+func napiGoTSFNFinalize(cEnv C.napi_env, cData, cHint unsafe.Pointer) {
+	if cData == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "node-api: panic finalizing threadsafe function: %v\n", r)
+		}
+	}()
+	defer freeBox(cData)
+
+	st, ok := loadBox(cData).(*tsfnState)
+	if !ok || st == nil {
+		return
+	}
+	st.finalize()
 }

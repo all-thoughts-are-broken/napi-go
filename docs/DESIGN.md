@@ -183,8 +183,10 @@ The fix lives in `napi/handle_token.go`: allocate a Go object per handle and use
   to `CloseHandleScope` is rejected instead of being reinterpreted.
 
 This is also why `AsyncWork` was correct from the start — it is a Go struct
-pointer, unique by construction. Tokens simply extend the same fact to the
-objects the engine allocates.
+pointer, unique by construction — and why a `ThreadsafeFunction` holds a pointer
+to its Go-side state instead of a token: that state has to exist anyway, and it
+is just as unique. Tokens simply extend the same fact to the objects the engine
+allocates.
 
 ## worker_threads (multiple environments)
 
@@ -245,30 +247,58 @@ a Go global is invisible to the other — and no copy is ever unloaded.
 
 ## Known limitations
 
-- **After `napi_release_threadsafe_function(..., napi_tsfn_abort)`, a single
-  event-loop turn destroys the object, contradicting the documented thread-count
-  semantics.** Measured with plain Node-API (the raw probe in
-  `probe/bridge.go`, Node.js 22, Windows):
+- **The engine frees a threadsafe function on its own schedule, and two
+  generations of it disagree about when.** Every function that takes the handle
+  dereferences it unchecked, so "when" decides what is a use-after-free
+  (`node_api.cc`, class `ThreadSafeFunction`):
+
+  | Engine | The object is freed | The use-after-free |
+  | --- | --- | --- |
+  | Node.js 18, 20, 22, and 24 up to 24.13 | as soon as it has been finalized, whatever its thread count says | any call after finalization, including the release a thread still "owes" |
+  | Node.js 24.14 and later | once it has been finalized *and* every thread has released | one call more than the threads held |
+
+  Finalization follows the last release, an abort, **or the environment shutting
+  down** — the last with no call from the addon at all. Measured on Node.js
+  22.22.2, Windows:
 
   | Sequence | Result |
   | --- | --- |
-  | `create(2) + abort + release` (same turn, no loop turn) | all `napi_ok` |
-  | `create(2) + abort` → one loop turn → `acquire` | `0xC0000028` |
-  | `create(2) + abort` → one loop turn → `release` | `0xC0000028` |
+  | A goroutine calls a function whose Worker was terminated | `0xC0000005` |
+  | Raw Node-API: `create(2) + abort + release` (same turn, no loop turn) | all `napi_ok` |
+  | Raw Node-API: `create(2) + abort` → one loop turn → `acquire` | `0xC0000028` |
+  | Raw Node-API: `create(2) + abort` → one loop turn → `release` | `0xC0000028` |
+  | Four threads blocked behind a full queue of one, then abort | one returns `napi_closing`, three stay blocked for good |
 
-  Thread counts 1/2/3 and bounded/unbounded queues all behave the same; only "no
-  event-loop turn" is safe. `0xC0000028` is `STATUS_ASSERTION_FAILURE`, which on
-  Windows is the classic symptom of entering a **deleted
-  `CRITICAL_SECTION`** — the engine's mutex went away with the object. The
-  Node-API documentation says the object is destroyed only once every thread has
-  released; the implementation disagrees.
+  `0xC0000028` is `STATUS_ASSERTION_FAILURE`, which on Windows is the classic
+  symptom of entering a **deleted `CRITICAL_SECTION`** — the engine's mutex went
+  away with the object. Thread counts 1/2/3 and bounded/unbounded queues all
+  behave the same. The last row is the engine waking one waiter (`Signal`) where
+  it has to wake them all.
 
-  The binding's response: after an abort, **everything returns `napi_closing`
-  and nothing is forwarded**, including the "remaining threads release" step the
-  documentation recommends for winding down. This does not pin the environment —
-  the engine has already run `ReleaseResources` before destroying the object
-  (`env->Unref()` plus removing the cleanup hook), so the process still exits.
-  The cost is that the engine object itself leaks; it cannot be reclaimed safely.
+  The one thing both generations agree on is the finalize callback: it runs on
+  the loop thread while the object is still allocated. The binding's handling
+  (`tsfnState` in `napi/async.go`) is built on that single point:
+
+  - Every call into the engine holds a read lock; the finalizer takes the write
+    lock, so it waits out the calls already inside the engine and none can start
+    afterwards.
+  - Inside the finalizer the binding hands back every thread count Go still
+    holds. The newer engine can then delete the object at once instead of
+    waiting for releases that will never be forwarded; for the older one it
+    changes nothing. Nothing leaks on either.
+  - From then on **everything returns `napi_closing` and nothing is forwarded**.
+    That holds after an abort too, including the "remaining threads release"
+    step the Node-API documentation recommends for winding down — on the older
+    engines that release is the faulting call.
+  - The engine is never asked to block. `Call(..., napi.Blocking)` queues
+    without blocking and, when the queue is full, waits in Go for a dispatch.
+    That is what makes it possible to wait for the calls in flight, and it wakes
+    every blocked caller when the function ends.
+
+  What remains: code holding a `ThreadsafeFunction` is not told that its
+  environment went away until its next call returns `napi_closing`. All of the
+  above is measured on Node.js 22, the older engine. The newer engine's path is
+  derived from its source; CI runs the same checks on Node.js 24, which ships it.
 
 - Node-API 9/10 APIs (external strings, property keys, syntax errors, module file
   names, …) are deliberately unbound: they would introduce new symbol
