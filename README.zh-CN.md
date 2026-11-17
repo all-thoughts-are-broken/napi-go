@@ -177,9 +177,11 @@ func SlowDouble(env napi.Env, info napi.CallbackInfo) napi.Value {
 	input, _ := napi.GetValueDouble(env, cb.Args[0])
 
 	promise, deferred, _ := napi.CreatePromise(env)
-	work, _ := napi.NewAsyncWork(env, "slowDouble",
+	var work *napi.AsyncWork
+	work, _ = napi.NewAsyncWork(env, "slowDouble",
 		func(e napi.Env) { /* 在线程池线程上：只能是纯 Go */ },
 		func(e napi.Env, err error) {
+			defer work.Delete(e) // 除此之外没有任何东西会释放这个 work
 			out, _ := napi.CreateDouble(e, input*2)
 			napi.ResolveDeferred(e, deferred, out)
 		})
@@ -187,6 +189,9 @@ func SlowDouble(env napi.Env, info napi.CallbackInfo) napi.Value {
 	return promise
 }
 ```
+
+> work 在被 Delete 之前一直存活。在它自己的 complete 回调里 Delete 是标准写法；
+> 漏掉的话，每次调用都会泄漏这个 work 以及它持有的回调。
 
 ## ABI 策略
 
@@ -205,8 +210,10 @@ func SlowDouble(env napi.Env, info napi.CallbackInfo) napi.Value {
 | 平台 | 链接方式 | 状态 |
 |---|---|---|
 | Windows x64 | 不链接任何库；`napi_*` 函数在插件加载时绑定到宿主进程 | ✅ 已验证 |
-| Linux x64 / arm64 | 不链接任何库；`-Wl,--unresolved-symbols=ignore-all`，`dlopen` 时由宿主进程解析符号 | ✅ CI 构建并测试 |
-| macOS x64 / arm64 | `-Wl,-undefined,dynamic_lookup` | ✅ CI 构建并测试 |
+| Linux x64 | 不链接任何库；`-Wl,--unresolved-symbols=ignore-all`，`dlopen` 时由宿主进程解析符号 | ✅ CI 构建并测试 |
+| Linux arm64 | 同 Linux x64 | 不在 CI 矩阵里 |
+| macOS arm64 | `-Wl,-undefined,dynamic_lookup` | ✅ CI 构建并测试 |
+| macOS x64 | 同 macOS arm64 | 不在 CI 矩阵里 |
 
 Linux 与 macOS 的宿主进程本身导出 `napi_*` 符号，动态加载器会自动解析，因此不需要
 额外文件。在这两个平台上构建只需要 Go 和 C 编译器。
@@ -248,7 +255,8 @@ Windows 的方案没有任何与架构相关的部分，所以 arm64 与 x86 不
 ## 测试
 
 ```sh
-# 功能断言（覆盖全部 138 个导出函数）
+# 功能检查：覆盖全部 138 个导出函数，外加各自在子进程里运行的进程生命周期用例
+# （worker 销毁、改名的宿主等）
 go build -buildmode=c-shared -o example/goaddon.node ./example
 node --expose-gc example/test.mjs
 
@@ -265,11 +273,11 @@ node --expose-gc probe/edge.mjs
 go test -race ./napi/...
 ```
 
-当前状态：功能断言 **71/71**、压测 **18/18**、`-race` 通过、探针套件 **0 bug**
+当前状态：功能检查 **77/77**、压测 **18/18**、`-race` 通过、探针套件 **0 bug**
 （探针剩余的 note 都是已记录的引擎行为，不是绑定缺陷）。
 
-CI 会在 Linux、macOS、Windows 三平台 × Node.js 18/20/22/24 上跑功能套件，
-并额外跑一次压测、探针与 race 检测。
+CI 会在 Linux x64、macOS arm64、Windows x64 × Node.js 18/20/22/24 上跑功能套件，
+并在 Linux 上额外跑一次压测、探针与 race 检测。
 
 ## 版本策略
 

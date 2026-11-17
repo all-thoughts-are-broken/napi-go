@@ -42,6 +42,13 @@ unresolved symbols (`-Wl,--unresolved-symbols=ignore-all`), and on macOS they us
 - **`was compiled against a different Node.js version` at load time** — the
   `node.exe` in use is older than the Node-API 8 baseline, i.e. earlier than Node
   **12.22**. Upgrade Node.js.
+- **The addon loads on the build machine but not elsewhere ("The specified
+  module could not be found")** — it may depend on a runtime DLL of the compiler
+  that is not part of Windows. `objdump -p addon.node | grep "DLL Name"` lists
+  what it needs; anything beyond `KERNEL32.dll`, `ntdll.dll` and the
+  `api-ms-win-crt-*` set belongs to the toolchain (`libmcfgthread-2.dll` with
+  MCF-thread builds of gcc, for example). Link it in statically:
+  `go build -buildmode=c-shared -ldflags "-extldflags=-static" -o addon.node .`
 - **The process crashes on `require`** — check that gcc is a UCRT build
   (`gcc --version` should mention `ucrt`). MSVCRT builds of gcc are untested.
 - **clang with the MSVC target** compiles and links (via `lld-link`) but the

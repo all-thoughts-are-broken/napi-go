@@ -190,9 +190,11 @@ func SlowDouble(env napi.Env, info napi.CallbackInfo) napi.Value {
 	input, _ := napi.GetValueDouble(env, cb.Args[0])
 
 	promise, deferred, _ := napi.CreatePromise(env)
-	work, _ := napi.NewAsyncWork(env, "slowDouble",
+	var work *napi.AsyncWork
+	work, _ = napi.NewAsyncWork(env, "slowDouble",
 		func(e napi.Env) { /* runs on a pool thread: pure Go only */ },
 		func(e napi.Env, err error) {
+			defer work.Delete(e) // nothing else frees the work item
 			out, _ := napi.CreateDouble(e, input*2)
 			napi.ResolveDeferred(e, deferred, out)
 		})
@@ -200,6 +202,10 @@ func SlowDouble(env napi.Env, info napi.CallbackInfo) napi.Value {
 	return promise
 }
 ```
+
+> A work item lives until it is deleted. Deleting it from its own completion
+> callback is the canonical pattern; without it every call leaks the item and
+> the callbacks it holds.
 
 ## ABI strategy
 
@@ -222,8 +228,10 @@ func SlowDouble(env napi.Env, info napi.CallbackInfo) napi.Value {
 | Platform | Linking | Status |
 |---|---|---|
 | Windows x64 | Nothing is linked; the `napi_*` functions are bound to the host process when the addon loads | ✅ Verified |
-| Linux x64 / arm64 | No library; `-Wl,--unresolved-symbols=ignore-all`, symbols resolved from the host process at `dlopen` time | ✅ Built and tested in CI |
-| macOS x64 / arm64 | `-Wl,-undefined,dynamic_lookup` | ✅ Built and tested in CI |
+| Linux x64 | No library; `-Wl,--unresolved-symbols=ignore-all`, symbols resolved from the host process at `dlopen` time | ✅ Built and tested in CI |
+| Linux arm64 | Same as Linux x64 | Not in the CI matrix |
+| macOS arm64 | `-Wl,-undefined,dynamic_lookup` | ✅ Built and tested in CI |
+| macOS x64 | Same as macOS arm64 | Not in the CI matrix |
 
 Because Linux and macOS hosts export the `napi_*` symbols from the main
 executable, the dynamic loader resolves them automatically — no extra files
@@ -272,7 +280,8 @@ behind each rule.
 ## Testing
 
 ```sh
-# Functional assertions (all 138 exported functions)
+# Functional checks: all 138 exported functions, plus process-lifecycle cases
+# (worker teardown, a renamed host, ...) that each run in a child process
 go build -buildmode=c-shared -o example/goaddon.node ./example
 node --expose-gc example/test.mjs
 
@@ -289,12 +298,13 @@ node --expose-gc probe/edge.mjs
 go test -race ./napi/...
 ```
 
-Current status: **71/71** functional assertions, **18/18** stress scenarios,
+Current status: **77/77** functional checks, **18/18** stress scenarios,
 `-race` clean, and **0 bugs** reported by the probe suites (the remaining probe
 notes are documented engine behaviours, not binding defects).
 
-CI runs the functional suite on Linux, macOS and Windows across Node.js 18, 20,
-22 and 24, and runs the stress and probe suites and the race detector once.
+CI runs the functional suite on Linux x64, macOS arm64 and Windows x64 across
+Node.js 18, 20, 22 and 24, and runs the stress and probe suites and the race
+detector once, on Linux.
 
 ## Versioning
 

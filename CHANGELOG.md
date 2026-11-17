@@ -122,6 +122,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documented
 
+- The README's async-work example never deleted its work item, so code copied
+  from it leaked the item and its callback box on every call. It now deletes
+  the item from the completion callback, as `example/main.go` always did.
+- The platform table said Linux arm64 and macOS x64 were built and tested in
+  CI. The matrix has Linux x64, macOS arm64 and Windows x64; the table says so.
+- BUILD: a Windows addon can pick up a dependency on the compiler's own runtime
+  DLL (`libmcfgthread-2.dll` with MCF-thread builds of gcc), which makes it load
+  on the build machine only. How to see it, and the static-link flag that
+  removes it.
 - `CreateError` / `CreateTypeError` / `CreateRangeError` take a `code` that
   must be a string or `nil`. Passing `undefined` returns
   `napi_string_expected` — easy to miss, because the call returns a

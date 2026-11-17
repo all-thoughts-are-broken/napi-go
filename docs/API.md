@@ -217,8 +217,10 @@ guarantees the lifetime).
 
 ## Test coverage
 
-The 71 assertions in `example/test.mjs` exercise every function in the tables
-above. The only exceptions are `FatalError` and `FatalException`: they terminate
+The checks in `example/test.mjs` exercise every function in the tables above;
+its process-lifecycle checks (a Worker ending under a running goroutine, a host
+executable with another name, ...) each run in a child process, because what
+they guard against takes the whole process down. The only exceptions are `FatalError` and `FatalException`: they terminate
 the process by design (`napi_fatal_error` prints and then aborts), so they cannot
 share a single run with the other assertions.
 

@@ -37,6 +37,12 @@ macOS 上用 `-Wl,-undefined,dynamic_lookup`。两者都已写在 `napi/cgo.go` 
   报错信息里给出了第一个缺失的函数名。
 - **加载时报 `was compiled against a different Node.js version`**：所用的
   `node.exe` 比 Node-API 8 基线更老，即早于 Node **12.22**。升级 Node.js。
+- **插件在构建机上能加载，换台机器就报「The specified module could not be
+  found」**：它可能依赖了编译器自带、但不属于 Windows 的运行时 DLL。
+  `objdump -p addon.node | grep "DLL Name"` 会列出它需要的 DLL；除了
+  `KERNEL32.dll`、`ntdll.dll` 和 `api-ms-win-crt-*` 那一组之外的都属于工具链
+  （例如 MCF 线程模型的 gcc 带来的 `libmcfgthread-2.dll`）。静态链接进去即可：
+  `go build -buildmode=c-shared -ldflags "-extldflags=-static" -o addon.node .`
 - **`require` 时进程崩溃**：确认 gcc 是 UCRT 构建（`gcc --version` 输出应含
   `ucrt`）。MSVCRT 构建的 gcc 未测试。
 - **clang（MSVC target）**：能编译链接（`lld-link`），但加载时挂起——怀疑

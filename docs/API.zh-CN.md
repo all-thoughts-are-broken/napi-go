@@ -195,7 +195,9 @@ tsfn.Acquire() / Release(mode) / Ref(env) / Unref(env)
 
 ## 测试覆盖
 
-`example/test.mjs` 的 71 项断言逐个走通上表列出的全部函数，只有
+`example/test.mjs` 的检查逐个走通上表列出的全部函数；其中的进程生命周期检查
+（goroutine 还在运行时 Worker 结束、可执行文件改了名的宿主等）各自在子进程里运行，
+因为它们防范的问题会让整个进程挂掉。只有
 `FatalError` / `FatalException` 例外：它们按设计终止进程
 （`napi_fatal_error` 打印后 abort），无法与其它断言共享一次运行。
 
