@@ -147,8 +147,11 @@ func napiGoPropsFinalizeCallback(cEnv C.napi_env, cData, cHint unsafe.Pointer) {
 	if cData == nil {
 		return
 	}
-	boxes := loadBox(cData).([]unsafe.Pointer)
-	freeBox(cData)
+	defer freeBox(cData)
+	boxes, ok := loadBox(cData).([]unsafe.Pointer)
+	if !ok {
+		return
+	}
 	for _, b := range boxes {
 		freeBox(b)
 	}

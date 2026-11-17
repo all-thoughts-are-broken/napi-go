@@ -95,6 +95,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   original exception propagated correctly all along. A panic that carries
   `napi_pending_exception` while an exception really is pending is now
   recognised as that exception on its way up and left alone.
+- **A panicking `SetInstanceData` finalizer leaked its box.** The release was
+  written inline after the user's callback, and a panic unwinds past it — the
+  mistake already fixed in the other finalizers. Measured: one box left behind
+  per environment torn down. The release is now deferred. The class-property
+  finalizer's unchecked type assertion also takes the `, ok` form the other
+  trampolines use.
 
 ### Removed
 

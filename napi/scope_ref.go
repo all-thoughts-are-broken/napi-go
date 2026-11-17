@@ -260,10 +260,13 @@ func napiGoInstanceDataFinalizeCallback(cEnv C.napi_env, cData, cHint unsafe.Poi
 	if cData == nil {
 		return
 	}
+	// Released by defer, like every other finalizer's box: a panic in the
+	// user's finalizer unwinds straight to the recover above and would skip an
+	// inline release.
+	defer freeBox(cData)
 	if p, ok := loadBox(cData).(finalizePayload); ok && p.fn != nil {
 		p.fn(env, p.data)
 	}
-	freeBox(cData)
 }
 
 // GetInstanceData returns the value installed with SetInstanceData.
